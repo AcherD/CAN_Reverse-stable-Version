@@ -4,7 +4,7 @@ import numpy as np
 
 
 class VisionDetector:
-    def __init__(self, model_path, conf_thresh=0.7, cam_id=0, debug=False):
+    def __init__(self, model_path, conf_thresh=0.7, cam_id=0, debug=True):
         self.session = ort.InferenceSession(model_path)
         # 从模型元数据中获取输入尺寸
         model_input = self.session.get_inputs()[0]

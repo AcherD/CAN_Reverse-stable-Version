@@ -126,7 +126,7 @@ class CVAutoFuzz:
         error_list = []
         error_seen = set()  # track unique error labels seen
         while self.threads_running:
-            time.sleep(1)  # throttle detection to roughly 1 frame per second
+            time.sleep(0.01)  # throttle detection to roughly 1 frame per second
             detections = self.detector.detect()
             for d in detections:
                 label = d['label']

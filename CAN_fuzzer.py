@@ -22,7 +22,7 @@ class Bisecter:
         return self.candidate[low]
 
 class CANFuzzer:
-    def __init__(self, channel='can1', bustype='socketcan', max_freq=100):
+    def __init__(self, channel='can0', bustype='socketcan', max_freq=100):
         self.bus = can.interface.Bus(channel=channel, bustype=bustype)
         self.sent_log = []
         self.min_interval = 1.0 / max_freq  # 每秒最多发送max_freq帧
@@ -97,7 +97,7 @@ class CANFuzzer:
 # 以下为工具类
 
 # 从文件中发送报文
-def send_can_messages_from_file(file_path, channel='can1', interface='socketcan', bitrate=500000):
+def send_can_messages_from_file(file_path, channel='can0', interface='socketcan', bitrate=500000):
     """
     发送CAN报文
     参数：

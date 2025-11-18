@@ -4,7 +4,7 @@ vision:
   cam_id: 0
 
 can:
-  channel: "can1"
+  channel: "can0"
   bustype: "socketcan"
 
 error_labels: ['Anti Lock Braking System',
