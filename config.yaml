@@ -1,0 +1,19 @@
+vision:
+  model_path: "best.onnx"
+  conf_thresh: 0.7
+  cam_id: 0
+
+can:
+  channel: "can1"
+  bustype: "socketcan"
+
+error_labels: ['Anti Lock Braking System',
+    'Braking System Issue',
+    'Charging System Issue',
+    'Check Engine',
+    'Electronic Stability Problem -ESP-',
+    'Engine Overheating Warning Light',
+    'Low Engine Oil Warning Light',
+    'Low Tire Pressure Warning Light',
+    'Master warning light',
+    'SRS-Airbag']  # 需要监控的错误标签
