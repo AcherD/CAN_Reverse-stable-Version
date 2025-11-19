@@ -36,10 +36,14 @@ def main():
     can_config = config.get('can', {})
     can_channel = can_config.get('channel', 'can0')
     can_bustype = can_config.get('bustype', 'socketcan')
-
+    can_id_start = can_config.get('id_start', 0x100)
+    can_id_end = can_config.get('id_end', 0x1FF)
     # 实例化时传入参数
-    fuzzer = CANFuzzer(channel=can_channel, bustype=can_bustype)
-    print(f"Initialized CANFuzzer on channel: {can_channel}, bustype: {can_bustype}")
+    fuzzer = CANFuzzer(channel=can_channel, bustype=can_bustype,
+                       id_start=can_id_start, id_end=can_id_end)
+    print(
+        f"Initialized CANFuzzer on channel: {can_channel}, bustype: {can_bustype}, id_range=0x{int(can_id_start):X}-0x{int(can_id_end):X}")
+
 
     # Start the vision detection in a separate thread
     result_queue = Queue()

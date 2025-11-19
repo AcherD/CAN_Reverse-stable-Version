@@ -22,17 +22,22 @@ class Bisecter:
         return self.candidate[low]
 
 class CANFuzzer:
-    def __init__(self, channel='can0', bustype='socketcan', max_freq=100):
+    def __init__(self, channel='can0', bustype='socketcan', max_freq=100, id_start=0x100, id_end=0x1FF):
         self.channel = channel
         self.bustype = bustype
         self.bus = can.interface.Bus(channel=channel, bustype=bustype)
         self.sent_log = []
         self.min_interval = 1.0 / max_freq  # 每秒最多发送max_freq帧
         self.last_send_time = time.time()
+        # ID 范围
+        self.id_start = int(id_start)
+        self.id_end = int(id_end)
+        # 发送控制标志
+        self.recording = False
 
     def generate_random_msg(self):
-        # 生成随机CAN ID和数据
-        arb_id = random.randint(0x100, 0x1FF)
+        # 使用实例范围生成随机CAN ID和数据
+        arb_id = random.randint(self.id_start, self.id_end)
         data = bytes([random.randint(0, 255) for _ in range(8)])
         return can.Message(arbitration_id=arb_id, data=data)
 
@@ -61,13 +66,14 @@ class CANFuzzer:
         # 生成种子
         set_seed()
         for i in range(0, 1000):
-            msg = generate_random_msg()
+            # 使用实例方法生成
+            msg = self.generate_random_msg()
             arb_id = msg.arbitration_id
             data = msg.data
             write_directive_to_file_handle(output_file, arb_id=arb_id, data=data)
         output_file.close()
-         # 发送生成的所有报文
-        send_can_messages_from_file("can_temp.txt",channel=self.channel,interface=self.bustype)
+        # 发送生成的所有报文
+        send_can_messages_from_file("can_temp.txt", channel=self.channel, interface=self.bustype)
 
         # while time.time() - start_time < duration:
         #     msg = self.generate_random_msg()
@@ -165,10 +171,10 @@ def set_seed(seed=None):
     print("Seed: {0} (0x{0:x})".format(seed))
     random.seed(seed)
 
-# 生成报文
-def generate_random_msg():
-    # 生成随机CAN ID和数据
-    arb_id = random.randint(0x100, 0x1FF)
+
+# 模块级兼容函数，允许调用时指定范围
+def generate_random_msg(id_start=0x100, id_end=0x1FF):
+    arb_id = random.randint(int(id_start), int(id_end))
     data = bytes([random.randint(0, 255) for _ in range(8)])
     return can.Message(arbitration_id=arb_id, data=data)
 

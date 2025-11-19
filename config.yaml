@@ -6,6 +6,8 @@ vision:
 can:
   channel: "can0"
   bustype: "socketcan"
+  id_start: 0x180
+  id_end: 0x189
 
 error_labels: ['Anti Lock Braking System',
     'Braking System Issue',
