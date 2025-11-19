@@ -23,6 +23,8 @@ class Bisecter:
 
 class CANFuzzer:
     def __init__(self, channel='can0', bustype='socketcan', max_freq=100):
+        self.channel = channel
+        self.bustype = bustype
         self.bus = can.interface.Bus(channel=channel, bustype=bustype)
         self.sent_log = []
         self.min_interval = 1.0 / max_freq  # 每秒最多发送max_freq帧
@@ -63,8 +65,9 @@ class CANFuzzer:
             arb_id = msg.arbitration_id
             data = msg.data
             write_directive_to_file_handle(output_file, arb_id=arb_id, data=data)
+        output_file.close()
          # 发送生成的所有报文
-        send_can_messages_from_file("can_temp.txt")
+        send_can_messages_from_file("can_temp.txt",channel=self.channel,interface=self.bustype)
 
         # while time.time() - start_time < duration:
         #     msg = self.generate_random_msg()

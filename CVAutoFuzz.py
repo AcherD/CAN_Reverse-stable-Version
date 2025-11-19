@@ -7,10 +7,12 @@ from CAN_fuzzer import CANFuzzer
 import time
 from queue import Queue
 
+
 class CVAutoFuzz:
     def __init__(self, config):
         self.threads_running = True
         self.detector = VisionDetector(**config['vision'])
+        self.can_config = config.get('can',{})
         # self.fuzzer = CANFuzzer(**config['can'])
         self.error_labels = config['error_labels']  # 需要触发二分法的错误标签
 
@@ -175,6 +177,11 @@ class CVAutoFuzz:
         self.start_detection(temp_queue)
         # Send all CAN messages from the file (this will block until done)
         from CAN_fuzzer import send_can_messages_from_file
+        channel = self.can_config.get('channel', 'can0')
+        bustype = self.can_config.get('bustype', 'socketcan')
+
+        # 显式传递参数
+        send_can_messages_from_file(file_path, channel=channel, interface=bustype)
         send_can_messages_from_file(file_path)
         # Stop detection and collect results
         self.stop_detection()

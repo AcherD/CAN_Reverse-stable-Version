@@ -32,6 +32,15 @@ def main():
     autofuzz = CVAutoFuzz(config)
     fuzzer = CANFuzzer()
 
+    # 获取配置中的 CAN 参数，如果没有则使用默认值
+    can_config = config.get('can', {})
+    can_channel = can_config.get('channel', 'can0')
+    can_bustype = can_config.get('bustype', 'socketcan')
+
+    # 实例化时传入参数
+    fuzzer = CANFuzzer(channel=can_channel, bustype=can_bustype)
+    print(f"Initialized CANFuzzer on channel: {can_channel}, bustype: {can_bustype}")
+
     # Start the vision detection in a separate thread
     result_queue = Queue()
     autofuzz.start_detection(result_queue)
