@@ -30,7 +30,7 @@ def main():
     # Load configuration and initialize CVAutoFuzz
     config = load_yaml("config.yaml")
     autofuzz = CVAutoFuzz(config)
-    fuzzer = CANFuzzer()
+    # fuzzer = CANFuzzer()
 
     # 获取配置中的 CAN 参数，如果没有则使用默认值
     can_config = config.get('can', {})
@@ -38,11 +38,12 @@ def main():
     can_bustype = can_config.get('bustype', 'socketcan')
     can_id_start = can_config.get('id_start', 0x100)
     can_id_end = can_config.get('id_end', 0x1FF)
+    can_send_delay = can_config.get('send_delay', 0.01)
     # 实例化时传入参数
     fuzzer = CANFuzzer(channel=can_channel, bustype=can_bustype,
-                       id_start=can_id_start, id_end=can_id_end)
+                       id_start=can_id_start, id_end=can_id_end,send_delay=can_send_delay)
     print(
-        f"Initialized CANFuzzer on channel: {can_channel}, bustype: {can_bustype}, id_range=0x{int(can_id_start):X}-0x{int(can_id_end):X}")
+        f"Initialized CANFuzzer on channel: {can_channel}, bustype: {can_bustype}, id_range=0x{int(can_id_start):X}-0x{int(can_id_end):X}, send_delay={can_send_delay}s")
 
 
     # Start the vision detection in a separate thread

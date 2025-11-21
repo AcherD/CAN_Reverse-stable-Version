@@ -179,9 +179,10 @@ class CVAutoFuzz:
         from CAN_fuzzer import send_can_messages_from_file
         channel = self.can_config.get('channel', 'can0')
         bustype = self.can_config.get('bustype', 'socketcan')
+        send_delay = self.can_config.get('send_delay', 0.5)
 
         # 显式传递参数
-        send_can_messages_from_file(file_path, channel=channel, interface=bustype)
+        send_can_messages_from_file(file_path, channel=channel, interface=bustype, send_delay=send_delay)
         # send_can_messages_from_file(file_path)
         # Stop detection and collect results
 

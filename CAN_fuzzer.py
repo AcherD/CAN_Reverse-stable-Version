@@ -22,7 +22,7 @@ class Bisecter:
         return self.candidate[low]
 
 class CANFuzzer:
-    def __init__(self, channel='can0', bustype='socketcan', max_freq=100, id_start=0x100, id_end=0x1FF):
+    def __init__(self, channel='can0', bustype='socketcan', max_freq=100, id_start=0x100, id_end=0x1FF,send_delay=0.01):
         self.channel = channel
         self.bustype = bustype
         self.bus = can.interface.Bus(channel=channel, bustype=bustype)
@@ -34,6 +34,8 @@ class CANFuzzer:
         self.id_end = int(id_end)
         # 发送控制标志
         self.recording = False
+        # 从配置传入的发送延迟（用于文件重放）
+        self.send_delay = send_delay
 
     def generate_random_msg(self):
         # 使用实例范围生成随机CAN ID和数据
@@ -73,7 +75,7 @@ class CANFuzzer:
             write_directive_to_file_handle(output_file, arb_id=arb_id, data=data)
         output_file.close()
         # 发送生成的所有报文
-        send_can_messages_from_file("can_temp.txt", channel=self.channel, interface=self.bustype)
+        send_can_messages_from_file("can_temp.txt", channel=self.channel, interface=self.bustype,send_delay=self.send_delay)
 
         # while time.time() - start_time < duration:
         #     msg = self.generate_random_msg()
@@ -106,7 +108,7 @@ class CANFuzzer:
 # 以下为工具类
 
 # 从文件中发送报文
-def send_can_messages_from_file(file_path, channel='can0', interface='socketcan', bitrate=500000):
+def send_can_messages_from_file(file_path, channel='can0', interface='socketcan', bitrate=500000, send_delay=0.01):
     """
     发送CAN报文
     参数：
@@ -152,7 +154,7 @@ def send_can_messages_from_file(file_path, channel='can0', interface='socketcan'
             # 发送消息
             bus.send(msg)
             print(f"已发送：ID=0x{can_id:X}, Data={data_bytes.hex()}")
-            time.sleep(0.01)  # 避免总线拥塞
+            time.sleep(send_delay)  # 避免总线拥塞
 
         bus.shutdown()
     except Exception as e:
