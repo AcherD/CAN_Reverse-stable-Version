@@ -67,37 +67,57 @@ def main():
 
     # If any error labels were detected during the initial round, perform binary search on messages
     if error_list:
-        input_file = "can_temp.txt"
-        # Narrow down the set of messages that trigger the error
-        while True:
-            # Read all CAN message lines from the current file
-            with open(input_file, 'r') as f:
-                lines = [line for line in f.read().splitlines() if line.strip()]
-            if len(lines) < 10:
-                # Stop narrowing down when fewer than 10 messages remain
-                break
-            # Split the current file into two halves (A.txt and B.txt)
-            fileA, fileB = autofuzz.split_file(input_file)
-            # Test each half to see which still triggers the error
-            resultA = autofuzz.send_and_detect(fileA)
-            resultB = False
-            if resultA:
-                # Error is triggered by messages in A.txt; continue with A.txt
-                input_file = fileA
-            else:
-                # If A half did not trigger, test B half
-                resultB = autofuzz.send_and_detect(fileB)
-                if resultB:
-                    # Error is triggered by messages in B.txt; continue with B.txt
-                    input_file = fileB
-                else:
-                    # Neither half triggered an error (unexpected if initial had error)
-                    print("Error not observed in either split; cannot isolate further.")
+        # 1. 去重：获取所有唯一的错误类型
+        unique_errors = list(set(error_list))
+        print(f"Detected unique errors: {unique_errors}")
+
+        # 2. 针对每一个错误，单独运行一轮二分查找
+        for target_error in unique_errors:
+            print(f"\n{'=' * 20}")
+            print(f"Starting Bisect for specific error: {target_error}")
+            print(f"{'=' * 20}")
+
+            # 每次针对新错误时，重置输入文件为完整的日志
+            input_file = "can_temp.txt"
+
+            # 这里的逻辑是为了防止找不到文件，或者文件已被覆盖
+            # 实际应用中建议把 can_temp.txt 复制一份作为 base
+
+            while True:
+                # 读取当前文件行数
+                with open(input_file, 'r') as f:
+                    lines = [line for line in f.read().splitlines() if line.strip()]
+
+                if len(lines) < 10:
+                    print(f"Bisect finished for {target_error}. Messages reduced to {len(lines)}.")
                     break
 
-        final_file = input_file  # The narrowed-down file with <10 messages
-        # Generate a comprehensive error report including the error labels and final messages
-        autofuzz.generate_error_report(error_list, final_file)
+                # 切分文件
+                fileA, fileB = autofuzz.split_file(input_file)
+
+                # 3. 关键修改：传入 target_label
+                # 先测 A 半区
+                print(f"Testing split A for {target_error}...")
+                if autofuzz.send_and_detect(fileA, target_label=target_error):
+                    input_file = fileA
+                    print("  -> Error found in A. Discarding B.")
+                    continue  # 直接进入下一次循环
+
+                # 如果 A 没触发，测 B 半区
+                print(f"Testing split B for {target_error}...")
+                if autofuzz.send_and_detect(fileB, target_label=target_error):
+                    input_file = fileB
+                    print("  -> Error found in B. Discarding A.")
+                    continue
+
+                # 如果两边都没触发 (可能因为错误是间歇性的，或者被切分打断了时序)
+                print(f"Error {target_error} not reproduced in either split. Stopping bisect.")
+                break
+
+            # 4. 为当前这个错误生成独立的报告
+            # input_file 此时是针对该错误的最小触发集
+            autofuzz.generate_error_report([target_error], input_file)
+
     else:
         print("No errors were detected in the first round of fuzzing.")
 

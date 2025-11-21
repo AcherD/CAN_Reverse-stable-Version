@@ -166,11 +166,11 @@ class CVAutoFuzz:
         print(f"Split {input_file} into A.txt ({len(linesA)} lines) and B.txt ({len(linesB)} lines).")
         return "A.txt", "B.txt"
 
-    def send_and_detect(self, file_path: str) -> bool:
+    def send_and_detect(self, file_path: str, target_label: str = None) -> bool:
         """
-        Send all CAN messages from the given file and check via visual detection
-        if any error label is triggered during the sending.
-        Returns True if an error was detected, otherwise False.
+        发送 CAN 报文并检测视觉反馈。
+        :param file_path: 包含 CAN 报文的文件路径
+        :param target_label: (新增) 如果指定了该参数，只有检测到该特定标签时才返回 True
         """
         # Set up a local queue for detection results and start detection thread
         temp_queue = Queue()
@@ -182,8 +182,9 @@ class CVAutoFuzz:
 
         # 显式传递参数
         send_can_messages_from_file(file_path, channel=channel, interface=bustype)
-        send_can_messages_from_file(file_path)
+        # send_can_messages_from_file(file_path)
         # Stop detection and collect results
+
         self.stop_detection()
         error_labels = []
         if not temp_queue.empty():
@@ -191,7 +192,16 @@ class CVAutoFuzz:
         # If any error labels were detected during this send, return True
         has_error = (len(error_labels) > 0)
         print(f"send_and_detect: Completed sending {file_path}, error_detected={has_error}.")
-        return has_error
+        if target_label:
+            # 如果指定了目标，只有包含目标才算成功
+            hit = target_label in error_labels
+            if hit:
+                print(f"  [+] Target '{target_label}' found in this split.")
+            return hit
+        else:
+            # 没指定目标（如第一轮Fuzz），只要有任意错误就返回True
+            has_error = (len(error_labels = []) > 0)
+            return has_error
 
     def generate_error_report(self, labels: list, file_path: str):
         """
