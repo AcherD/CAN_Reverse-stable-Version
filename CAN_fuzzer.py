@@ -144,11 +144,13 @@ def send_can_messages_from_file(file_path, channel='can0', interface='socketcan'
                 print(f"格式错误：{line} -> {e}")
                 continue
 
+            # 11-bit IDs are <= 0x7FF, 29-bit (extended) otherwise
+            is_ext = True if can_id > 0x7FF else False
             # 创建CAN消息（假设使用扩展帧）
             msg = can.Message(
                 arbitration_id=can_id,
                 data=data_bytes,
-                is_extended_id=True  # 根据ID长度自动判断更安全
+                is_extended_id=is_ext  # 根据ID长度自动判断更安全
             )
 
             # 发送消息
