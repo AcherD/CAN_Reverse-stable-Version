@@ -7,7 +7,7 @@ from CVAutoFuzz import CVAutoFuzz
 import yaml
 from pathlib import Path
 from queue import Queue
-
+import os
 
 def load_yaml(yaml_path: str) -> dict:
     """
@@ -26,11 +26,34 @@ def load_yaml(yaml_path: str) -> dict:
     except yaml.YAMLError as e:
         raise yaml.YAMLError(f"YAML syntax error in {yaml_path}: {str(e)}")
 
+def get_next_exp_dir(base_dir='run') -> str:
+    """
+    在 base_dir 下创建下一个 expN 文件夹并返回路径
+    """
+    os.makedirs(base_dir, exist_ok=True)
+    # 查找已有 expN
+    max_idx = -1
+    for name in os.listdir(base_dir):
+        if name.startswith('exp'):
+            try:
+                idx = int(name[3:])
+                if idx > max_idx:
+                    max_idx = idx
+            except ValueError:
+                continue
+    next_idx = max_idx + 1
+    exp_path = os.path.join(base_dir, f"exp{next_idx}")
+    os.makedirs(exp_path, exist_ok=True)
+    return exp_path
+
 def main():
+    exp_dir = get_next_exp_dir('run')
+    print(f"Using experiment dir: {exp_dir}")
     # Load configuration and initialize CVAutoFuzz
     config = load_yaml("config.yaml")
     autofuzz = CVAutoFuzz(config)
     # fuzzer = CANFuzzer()
+    os.chdir(exp_dir)
 
     # 获取配置中的 CAN 参数，如果没有则使用默认值
     can_config = config.get('can', {})
