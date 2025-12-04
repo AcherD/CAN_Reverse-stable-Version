@@ -9,7 +9,7 @@ can:
   id_start: 0x180
   id_end: 0x189
   send_delay: 0.5  # seconds
-
+test_hours: 2
 error_labels: ['Anti Lock Braking System',
     'Braking System Issue',
     'Charging System Issue',
