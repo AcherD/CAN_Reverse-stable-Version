@@ -16,10 +16,13 @@ os.makedirs(CAN_BATCH_DIR, exist_ok=True)
 LIGHT_IDS = [0x180 + i for i in range(10)]
 FRAMES_TARGET = 200
 MAX_COMBO = 3
-LIGHT_ON_DURATION = 0.5  # seconds
+LIGHT_ON_DURATION = 0.5
+ADJUST_INTERVAL = 50
+ADJUST_PAUSE = 10
 
 CAM_INDEX = 0
 RESOLUTION = (640, 480)
+DEBUG_WINDOW = "camera_debug"
 
 CAN_CHANNEL = "can0"
 CAN_INTERFACE = "socketcan"
@@ -58,6 +61,8 @@ def capture_dataset():
     if not cap.isOpened():
         raise RuntimeError("摄像头打开失败")
 
+    cv2.namedWindow(DEBUG_WINDOW, cv2.WINDOW_NORMAL)
+
     saved = 0
     try:
         for batch_file in batch_files:
@@ -75,6 +80,9 @@ def capture_dataset():
                 print("读取帧失败，跳过该批次")
                 continue
 
+            cv2.imshow(DEBUG_WINDOW, frame)
+            cv2.waitKey(1)
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"yolov5lite_{saved:04d}_{timestamp}.jpg"
             filepath = os.path.join(SAVE_DIR, filename)
@@ -82,10 +90,15 @@ def capture_dataset():
             saved += 1
             print(f"[{saved}/{FRAMES_TARGET}] 保存 {filepath}")
 
+            if saved % ADJUST_INTERVAL == 0 and saved < FRAMES_TARGET:
+                print(f"已采集 {saved} 张，暂停 {ADJUST_PAUSE}s 以调整角度...")
+                time.sleep(ADJUST_PAUSE)
+
             if saved >= FRAMES_TARGET:
                 break
     finally:
         cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
