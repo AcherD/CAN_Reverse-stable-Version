@@ -1,6 +1,6 @@
 vision:
   model_path: "best.onnx"
-  conf_thresh: 0.7
+  conf_thresh: 0.4
   cam_id: 0
 
 can:
@@ -9,7 +9,7 @@ can:
   id_start: 0x180
   id_end: 0x189
   send_delay: 0.5  # seconds
-test_hours: 2
+test_hours: 9
 error_labels: ['Anti Lock Braking System',
     'Braking System Issue',
     'Charging System Issue',

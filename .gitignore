@@ -22,3 +22,5 @@ log.txt
 utils/best.onnx
 utils/data_se
 run
+utils/data_set
+utils/can_batches

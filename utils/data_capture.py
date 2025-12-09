@@ -22,7 +22,7 @@ except Exception:
             "  python3 -m pip install --upgrade Pillow"
         )
 
-SAVE_DIR = "data_se"
+SAVE_DIR = "data_set"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 class CameraApp:
