@@ -23,3 +23,4 @@
 
 5.处理不同报文触发同一个故障灯的情况，筛选之后再进行do—calculus分析
 
+# 关于Adaptive fuzzer
