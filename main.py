@@ -214,13 +214,15 @@ def adaptive_main():
         beta=5.0,
         default_freq_hz=10.0,
         frames_per_episode=20,
-        settle_time=0.2,
+        settle_time=0.6, #发送完一组报文之后的等待时间，应该大于灯熄灭时间
         min_byte_trials_for_bit=2,
         byte_reward_threshold_for_bit=1.0,
         neighbor_delta=0x1,
         neighbor_reward_threshold=2.0,
         neighbor_min_trials=5,
-        log_dir="logs"
+        log_dir="logs",
+        min_bit_events_for_mapping=3,
+        min_confidence_for_mapping=0.6,
     )
 
     # 4. 运行若干 episode（例如 500 个）

@@ -46,15 +46,18 @@ class VisionGuidedAdaptiveFuzzer:
         default_freq_hz: float = 10.0,
         frames_per_episode: int = 20,
         settle_time: float = 0.2,
-        # bit-scan 相关阈值
+        # bit-scan 触发阈值
         min_byte_trials_for_bit: int = 2,
         byte_reward_threshold_for_bit: float = 1.0,
         # 邻域扩展相关参数
         neighbor_delta: int = 0x1,
         neighbor_reward_threshold: float = 2.0,
         neighbor_min_trials: int = 5,
-        # 日志相关
+        # 日志与报告
         log_dir: str = "logs",
+        # bit→灯映射统计阈值
+        min_bit_events_for_mapping: int = 3,
+        min_confidence_for_mapping: float = 0.6,
     ):
         """
         :param can_fuzzer: 已初始化的 CANFuzzer，用于访问 bus 和 ID 范围
@@ -78,10 +81,11 @@ class VisionGuidedAdaptiveFuzzer:
         self.can_fuzzer = can_fuzzer
         self.detector = detector
 
+        # 全局 ID 范围
         self.id_min = int(id_start)
         self.id_max = int(id_end)
 
-        # 初始 ID 候选集
+        # 初始 ID 候选集（可以用 sniff 到的 seed IDs）
         if seed_ids is not None and len(seed_ids) > 0:
             self.id_candidates: List[int] = sorted(
                 cid for cid in set(int(x) for x in seed_ids)
@@ -111,19 +115,17 @@ class VisionGuidedAdaptiveFuzzer:
         for cid in self.id_candidates:
             self.id_payload_state[cid] = self._init_payload_state()
 
-        # Vision 相关
-        self.labels: List[str] = detector.labels
+        # Vision: label 列表
+        # 若 VisionDetector 自己带有 labels 列表则复用，否则根据检测结果动态构建
+        self.labels: List[str] = getattr(detector, "labels", [])
         self.K: int = len(self.labels)
 
-        # 全局覆盖集合：记录已经出现过的灯状态模式
-        self.coverage = set()
+        # 覆盖统计
+        self.coverage = set()                   # 全局灯态模式
+        self.id_patterns: Dict[int, set] = defaultdict(set)  # 每个 ID 的灯态模式集合
 
-        # 每个 ID 对应的灯态模式集合（便于 summary）
-        self.id_patterns: Dict[int, set] = defaultdict(set)
-
-        # 逐 episode 日志
-        self.episode_log: List[Dict] = []
-
+        # 日志与聚合统计
+        self.episode_log: List[Dict] = []  # 每个 episode 的详细记录
         # 每个 ID + payload 的统计（count, total_reward, max_reward）
         self.id_payload_stats: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(dict)
 
@@ -139,8 +141,10 @@ class VisionGuidedAdaptiveFuzzer:
         self.neighbor_delta = int(neighbor_delta)
         self.neighbor_reward_threshold = float(neighbor_reward_threshold)
         self.neighbor_min_trials = int(neighbor_min_trials)
+        self.min_bit_events_for_mapping = int(min_bit_events_for_mapping)
+        self.min_confidence_for_mapping = float(min_confidence_for_mapping)
 
-        # 日志目录与 run_id
+        # 日志输出路径
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -148,7 +152,22 @@ class VisionGuidedAdaptiveFuzzer:
         # 便于停止的标志
         self._stop_flag = False
 
-    # ========= 公共接口 =========
+    # ========== 状态初始化 ==========
+
+    def _init_payload_state(self) -> Dict:
+        return {
+            "stage": "byte_scan",     # 或 "bit_scan"
+            "byte_rewards": [0.0] * 8,
+            "byte_counts": [0] * 8,
+            "next_byte": 0,
+            "neighbor_expanded": False,
+            "target_byte": None,      # 进入 bit_scan 后锁定的字节
+            "bit_rewards": None,
+            "bit_counts": None,
+            "next_bit": None,
+        }
+
+    # ========== 外部接口 ==========
 
     def stop(self):
         """外部可调用，用于提前结束 run() 循环。"""
@@ -172,10 +191,10 @@ class VisionGuidedAdaptiveFuzzer:
                     print(f"[AdaptiveFuzzer] Stopped externally at episode {ep}.")
                     break
 
-                # 1. 选择 ID（epsilon-greedy）
+                # 1) 选择 ID（epsilon-greedy）
                 cid = self._select_id()
 
-                # 2. 根据该 ID 对应的 payload 探索状态选择 payload
+                # 2) 选 payload（byte/bit 探索）
                 payload_bytes, byte_index, bit_index = self._select_payload_for_id(cid)
 
                 # 3. 发送前等待，采样前状态
@@ -233,22 +252,7 @@ class VisionGuidedAdaptiveFuzzer:
             self._save_logs_and_report()
             print("[AdaptiveFuzzer] Fuzzing finished and report generated.")
 
-    # ========= 内部辅助：payload 状态初始化 =========
-
-    def _init_payload_state(self) -> Dict:
-        return {
-            "stage": "byte_scan",
-            "byte_rewards": [0.0] * 8,
-            "byte_counts": [0] * 8,
-            "next_byte": 0,
-            "neighbor_expanded": False,
-            "target_byte": None,
-            "bit_rewards": None,
-            "bit_counts": None,
-            "next_bit": None,
-        }
-
-    # ========= 核心子模块 =========
+    # ========== ID / payload 选择 ==========
 
     def _select_id(self) -> int:
         """
@@ -356,6 +360,8 @@ class VisionGuidedAdaptiveFuzzer:
 
         return payload_bytes, target_byte, bit_index
 
+    # ========== 发送报文与视觉采样 ==========
+
     def _send_episode(self, cid: int, payload_bytes: bytes):
         """
         在当前 episode 内，以 default_freq_hz 频率发送 frames_per_episode 帧相同报文。
@@ -378,21 +384,40 @@ class VisionGuidedAdaptiveFuzzer:
 
     def _get_light_state(self) -> Tuple[int, ...]:
         """
-        调用 VisionDetector.detect()，根据当前帧的检测结果生成长度为 K 的灯状态向量。
+        调用 VisionDetector.detect()，获取当前帧检测结果，转换成固定长度（K）的 0/1 向量。
+        若 detector.labels 不存在，则在第一次检测时动态创建 label 列表。。
         :return: 例如 (0,1,0,1,...)
         """
         detections = self.detector.detect()
-        state = [0] * self.K
         if not detections:
-            return tuple(state)
+            return tuple([0] * self.K)
 
+        # 若 labels 为空，按首次检测的 label 顺序构建
+        if not self.labels:
+            for det in detections:
+                lbl = det["label"]
+                if lbl not in self.labels:
+                    self.labels.append(lbl)
+            self.K = len(self.labels)
+
+        state = [0] * self.K
         label_to_idx = {lbl: idx for idx, lbl in enumerate(self.labels)}
+
         for det in detections:
             lbl = det["label"]
-            if lbl in label_to_idx:
-                state[label_to_idx[lbl]] = 1
+            idx = label_to_idx.get(lbl)
+            if idx is None:
+                # 新 label：动态扩展
+                self.labels.append(lbl)
+                label_to_idx[lbl] = len(self.labels) - 1
+                state.append(1)
+                self.K = len(self.labels)
+            else:
+                state[idx] = 1
 
         return tuple(state)
+
+    # ========== reward 与 bandit 更新 ==========
 
     def _compute_reward(
         self,
@@ -401,10 +426,12 @@ class VisionGuidedAdaptiveFuzzer:
     ) -> Tuple[float, int, bool]:
         """
         根据前后灯状态计算 reward：
-        r = alpha * (#changed) + beta * (is_new_pattern)
+        reward = alpha * (#灯变化数) + beta * (是否出现新灯态模式)
         """
-        changed_cnt = sum(1 for b, a in zip(L_before, L_after) if b != a)
+        if len(L_before) != len(L_after):
+            return 0.0, 0, False
 
+        changed_cnt = sum(1 for b, a in zip(L_before, L_after) if b != a)
         is_new = L_after not in self.coverage
         if is_new:
             self.coverage.add(L_after)
@@ -433,14 +460,14 @@ class VisionGuidedAdaptiveFuzzer:
     ):
         """
         更新该 ID 对应的 payload 探索统计：
-        - 在 byte_scan 阶段：更新 byte_rewards/byte_counts；
+        - 在 byte_scan 阶段：更新 byte_rewards/byte_counts；并根据阈值决定是否进入 bit_scan；
         - 在 bit_scan 阶段：更新 bit_rewards/bit_counts；
         并在 byte_scan 阶段满足条件时升级到 bit_scan。
         """
         state = self.id_payload_state[cid]
         stage = state["stage"]
 
-        # 1) BYTE 级统计
+        # 1) byte 级统计
         byte_rewards = state["byte_rewards"]
         byte_counts = state["byte_counts"]
         if 0 <= byte_index < 8:
@@ -475,7 +502,6 @@ class VisionGuidedAdaptiveFuzzer:
                         idx for idx, br in enumerate(byte_rewards) if br == max_R
                     ]
                     target_byte = random.choice(active_bytes)
-
                     state["stage"] = "bit_scan"
                     state["target_byte"] = target_byte
                     state["bit_rewards"] = [0.0] * 8
@@ -484,8 +510,8 @@ class VisionGuidedAdaptiveFuzzer:
 
     def _maybe_expand_neighbors(self, cid: int):
         """
-        若某个 ID 的平均 reward 较高且尝试次数足够，则在其邻域添加新的 ID。
-        邻域定义为 [cid - neighbor_delta, cid + neighbor_delta] 交 [id_min, id_max]。
+        若某 ID 的平均 reward 较高且尝试次数足够，则在其邻域添加新的 ID。
+        邻域：cid ± neighbor_delta，限制在全局 [id_min, id_max] 中。
         每个 ID 只扩展一次。
         """
         state = self.id_payload_state[cid]
@@ -520,7 +546,7 @@ class VisionGuidedAdaptiveFuzzer:
 
         state["neighbor_expanded"] = True
 
-    # ========= 日志 & 报告 =========
+    # ========== Episode 日志与 payload 统计 ==========
 
     def _log_episode(
         self,
@@ -571,58 +597,121 @@ class VisionGuidedAdaptiveFuzzer:
         per_id[key] = entry
         self.id_payload_stats[cid] = per_id
 
-    def _save_logs_and_report(self):
+    # ========== bit→灯映射统计 ==========
+
+    def _build_bit_mapping_stats(self) -> List[Dict]:
         """
-        将 episode 级别日志写入 CSV，并生成一份汇总报告（txt + json）。
+        在 bit_scan 阶段的 episode 上统计 (ID, byte, bit) 与各个灯之间的 on/off 事件，
+        并推断 bit→灯映射、极性与置信度。
         """
-        if not self.episode_log:
-            print("[AdaptiveFuzzer] No episodes recorded, skip logging.")
-            return
+        # key: (cid, byte, bit, lamp_idx) -> {"on": int, "off": int}
+        bit_stats: Dict[Tuple[int, int, int, int], Dict[str, int]] = {}
+        # key: (cid, byte, bit) -> total episodes for this bit
+        bit_episode_counts: Dict[Tuple[int, int, int], int] = {}
 
-        base_name = f"adaptive_fuzz_{self.run_id}"
-        csv_path = os.path.join(self.log_dir, base_name + "_episodes.csv")
-        txt_path = os.path.join(self.log_dir, base_name + "_summary.txt")
-        json_path = os.path.join(self.log_dir, base_name + "_summary.json")
+        for rec in self.episode_log:
+            if rec.get("stage") != "bit_scan":
+                continue
+            bit_index = rec.get("bit_index", -1)
+            byte_index = rec.get("byte_index", -1)
+            if bit_index is None or bit_index < 0 or byte_index is None or byte_index < 0:
+                continue
 
-        # 1) 写 CSV 日志
-        fieldnames = list(self.episode_log[0].keys())
-        try:
-            with open(csv_path, "w", newline="", encoding="utf-8") as f_csv:
-                writer = csv.DictWriter(f_csv, fieldnames=fieldnames)
-                writer.writeheader()
-                for rec in self.episode_log:
-                    writer.writerow(rec)
-            print(f"[AdaptiveFuzzer] Episode log written to {csv_path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write CSV log: {e}")
+            cid = rec["id"]
+            Lb_str = rec.get("L_before", "")
+            La_str = rec.get("L_after", "")
+            if not Lb_str or not La_str:
+                continue
+            L_before = [int(ch) for ch in Lb_str]
+            L_after = [int(ch) for ch in La_str]
+            if len(L_before) != len(L_after):
+                continue
 
-        # 2) 生成汇总统计（内存中的 summary_dict）
-        summary_dict = self._build_summary_dict()
+            key_bit = (cid, byte_index, bit_index)
+            bit_episode_counts[key_bit] = bit_episode_counts.get(key_bit, 0) + 1
 
-        # 2.1 写 JSON（便于后处理）
-        try:
-            with open(json_path, "w", encoding="utf-8") as f_json:
-                json.dump(summary_dict, f_json, indent=2, ensure_ascii=False)
-            print(f"[AdaptiveFuzzer] Summary JSON written to {json_path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write JSON summary: {e}")
+            for lamp_idx, (b, a) in enumerate(zip(L_before, L_after)):
+                if b == 0 and a == 1:
+                    key = (cid, byte_index, bit_index, lamp_idx)
+                    st = bit_stats.get(key, {"on": 0, "off": 0})
+                    st["on"] += 1
+                    bit_stats[key] = st
+                elif b == 1 and a == 0:
+                    key = (cid, byte_index, bit_index, lamp_idx)
+                    st = bit_stats.get(key, {"on": 0, "off": 0})
+                    st["off"] += 1
+                    bit_stats[key] = st
 
-        # 2.2 写文本报告，便于人工阅读
-        try:
-            with open(txt_path, "w", encoding="utf-8") as f_txt:
-                self._write_human_readable_report(summary_dict, f_txt)
-            print(f"[AdaptiveFuzzer] Summary report written to {txt_path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write text summary: {e}")
+        mappings: List[Dict] = []
+        for (cid, byte_idx, bit_idx), ep_cnt in bit_episode_counts.items():
+            # 过滤：至少出现一定次数
+            if ep_cnt < self.min_bit_events_for_mapping:
+                continue
+
+            best_lamp = None
+            best_on = 0
+            best_off = 0
+            best_total = 0
+
+            for lamp_idx in range(self.K):
+                st = bit_stats.get((cid, byte_idx, bit_idx, lamp_idx))
+                if not st:
+                    continue
+                on = st["on"]
+                off = st["off"]
+                tot = on + off
+                if tot > best_total:
+                    best_total = tot
+                    best_lamp = lamp_idx
+                    best_on = on
+                    best_off = off
+
+            if best_lamp is None or best_total == 0:
+                continue
+
+            # 极性与置信度
+            if best_on > 2 * best_off:
+                polarity = "active_high"
+                main_count = best_on
+            elif best_off > 2 * best_on:
+                polarity = "active_low"
+                main_count = best_off
+            else:
+                polarity = "uncertain"
+                main_count = max(best_on, best_off)
+
+            confidence = main_count / float(ep_cnt)
+            if confidence < self.min_confidence_for_mapping:
+                continue
+
+            label = self.labels[best_lamp] if 0 <= best_lamp < len(self.labels) else str(best_lamp)
+            mappings.append({
+                "id": cid,
+                "id_hex": f"0x{cid:03X}",
+                "byte_index": byte_idx,
+                "bit_index": bit_idx,
+                "lamp_index": best_lamp,
+                "label": label,
+                "polarity": polarity,
+                "confidence": confidence,
+                "on_count": best_on,
+                "off_count": best_off,
+                "episodes": ep_cnt,
+            })
+
+        mappings_sorted = sorted(mappings, key=lambda m: (m["id"], m["byte_index"], m["bit_index"]))
+        return mappings_sorted
+
+    # ========== Summary 构建 & 报告输出 ==========
 
     def _build_summary_dict(self) -> Dict:
         """
-        汇总得到一个结构化的 summary_dict，用于 JSON 和文本报告。
+        构建结构化 summary，用于 JSON / TXT / PDF。
         """
         total_episodes = len(self.episode_log)
         total_patterns = len(self.coverage)
 
-        # 只统计 N>0 的 ID
+        # ID 概览统计
         id_summary = []
         for cid, stat in self.id_stats.items():
             if stat["N"] <= 0:
@@ -637,13 +726,9 @@ class VisionGuidedAdaptiveFuzzer:
                 "payload_variants": len(per_id_payload),
                 "pattern_count": len(patterns),
             })
+        id_summary_sorted = sorted(id_summary, key=lambda x: x["mean_reward"], reverse=True)
 
-        # 按 mean_reward 排序
-        id_summary_sorted = sorted(
-            id_summary, key=lambda x: x["mean_reward"], reverse=True
-        )
-
-        # 为每个 ID 选出若干高价值 payload 模式
+        # 每个 ID 选出若干高价值 payload 模式
         per_id_payload_top = {}
         for cid, payload_stats in self.id_payload_stats.items():
             # 跳过完全没试过的 ID
@@ -661,11 +746,11 @@ class VisionGuidedAdaptiveFuzzer:
                     "avg_reward": avg_reward,
                     "max_reward": max_reward,
                 })
-            # 按 avg_reward 排序，取前若干个
-            items_sorted = sorted(
-                items, key=lambda x: x["avg_reward"], reverse=True
-            )
+            items_sorted = sorted(items, key=lambda x: x["avg_reward"], reverse=True)
             per_id_payload_top[str(cid)] = items_sorted[:5]
+
+        # 计算 bit→灯 映射候选集
+        bit_mappings = self._build_bit_mapping_stats()
 
         summary_dict = {
             "run_id": self.run_id,
@@ -675,12 +760,13 @@ class VisionGuidedAdaptiveFuzzer:
             "label_mapping": {i: lbl for i, lbl in enumerate(self.labels)},
             "id_summary": id_summary_sorted,
             "id_payload_top": per_id_payload_top,
+            "bit_mappings": bit_mappings,
         }
         return summary_dict
 
     def _write_human_readable_report(self, summary: Dict, f_txt):
         """
-        将 summary_dict 以结构化文本形式写入文件，方便你直接阅读。
+        生成易读的文本报告（.txt），方便人工 review。
         """
         f_txt.write(f"Vision-Guided Adaptive CAN Fuzzing Report\n")
         f_txt.write(f"Run ID: {summary['run_id']}\n")
@@ -725,3 +811,129 @@ class VisionGuidedAdaptiveFuzzer:
                     f"max_reward={p['max_reward']:.2f}\n"
                 )
             f_txt.write("\n")
+
+        f_txt.write("Candidate bit-to-warning-light mappings:\n\n")
+        if not summary["bit_mappings"]:
+            f_txt.write("  (no bit-level mapping candidates that passed thresholds)\n")
+        else:
+            for m in summary["bit_mappings"]:
+                f_txt.write(
+                    f"- ID {m['id_hex']} Byte {m['byte_index']} Bit {m['bit_index']} "
+                    f"-> {m['label']} "
+                    f"({m['polarity']}, conf={m['confidence']:.2f}, "
+                    f"on={m['on_count']}, off={m['off_count']}, "
+                    f"episodes={m['episodes']})\n"
+                )
+
+    def _write_pdf_dbc_table(self, summary: Dict, pdf_path: str):
+        """
+        用 ReportLab 将 bit_mappings 导出为 PDF 形式的“候选 DBC 表”。
+        """
+        bit_mappings = summary.get("bit_mappings", [])
+        if not bit_mappings:
+            print("[AdaptiveFuzzer] No bit mappings to export to PDF.")
+            return
+
+        try:
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] ReportLab not available, skip PDF export: {e}")
+            return
+
+        doc = SimpleDocTemplate(pdf_path, pagesize=landscape(A4))
+        styles = getSampleStyleSheet()
+        story = []
+
+        title = Paragraph("Vision-Guided Candidate DBC Table", styles["Title"])
+        info = Paragraph(f"Run ID: {summary['run_id']}", styles["Normal"])
+        story.append(title)
+        story.append(Spacer(1, 6))
+        story.append(info)
+        story.append(Spacer(1, 12))
+
+        # 构造表格数据
+        data = [["ID (hex)", "Byte", "Bit", "Signal label", "Polarity",
+                 "Confidence", "#On", "#Off", "#Episodes"]]
+        for m in bit_mappings:
+            data.append([
+                m["id_hex"],
+                m["byte_index"],
+                m["bit_index"],
+                m["label"],
+                m["polarity"],
+                f"{m['confidence']:.2f}",
+                m["on_count"],
+                m["off_count"],
+                m["episodes"],
+            ])
+
+        table = Table(data, repeatRows=1)
+        style = TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ])
+        table.setStyle(style)
+        story.append(table)
+
+        doc.build(story)
+        print(f"[AdaptiveFuzzer] DBC candidate PDF written to {pdf_path}")
+
+    def _save_logs_and_report(self):
+        """
+        写入 episode 级别 CSV、JSON summary、TXT 报告，并生成 DBC PDF。
+        """
+        if not self.episode_log:
+            print("[AdaptiveFuzzer] No episodes recorded, skip logging.")
+            return
+
+        base_name = f"adaptive_fuzz_{self.run_id}"
+        csv_path = os.path.join(self.log_dir, base_name + "_episodes.csv")
+        txt_path = os.path.join(self.log_dir, base_name + "_summary.txt")
+        json_path = os.path.join(self.log_dir, base_name + "_summary.json")
+        pdf_path = os.path.join(self.log_dir, base_name + "_dbc_candidates.pdf")
+
+        # 1) 写 CSV 日志
+        fieldnames = list(self.episode_log[0].keys())
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f_csv:
+                writer = csv.DictWriter(f_csv, fieldnames=fieldnames)
+                writer.writeheader()
+                for rec in self.episode_log:
+                    writer.writerow(rec)
+            print(f"[AdaptiveFuzzer] Episode log written to {csv_path}")
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] Failed to write CSV log: {e}")
+
+        # 2) 构建 summary
+        summary_dict = self._build_summary_dict()
+
+        # 2.1 JSON
+        try:
+            with open(json_path, "w", encoding="utf-8") as f_json:
+                json.dump(summary_dict, f_json, indent=2, ensure_ascii=False)
+            print(f"[AdaptiveFuzzer] Summary JSON written to {json_path}")
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] Failed to write JSON summary: {e}")
+
+        # 2.2 TXT 报告
+        try:
+            with open(txt_path, "w", encoding="utf-8") as f_txt:
+                self._write_human_readable_report(summary_dict, f_txt)
+            print(f"[AdaptiveFuzzer] Summary report written to {txt_path}")
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] Failed to write text summary: {e}")
+
+        # 2.3 PDF DBC 表
+        try:
+            self._write_pdf_dbc_table(summary_dict, pdf_path)
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] Failed to write PDF DBC table: {e}")
