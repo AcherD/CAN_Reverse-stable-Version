@@ -8,6 +8,7 @@ import yaml
 from pathlib import Path
 from queue import Queue
 import os
+from adaptive_fuzzer import VisionGuidedAdaptiveFuzzer
 
 def load_yaml(yaml_path: str) -> dict:
     """
@@ -172,7 +173,59 @@ def main():
             round_idx += 1
             # 继续下一轮（检测线程和 fuzzer 状态在 start/stop 中已处理）
 
+def adaptive_main():
+    # 1. 读配置
+    config = load_yaml("config.yaml")
+    vision_cfg = config.get("vision", {})
+    can_cfg = config.get("can", {})
+
+    # 2. 初始化 VisionDetector 和 CANFuzzer
+    detector = VisionDetector(**vision_cfg)
+    can_channel = can_cfg.get('channel', 'can0')
+    can_bustype = can_cfg.get('bustype', 'socketcan')
+    can_id_start = can_cfg.get('id_start', 0x100)
+    can_id_end = can_cfg.get('id_end', 0x1FF)
+    can_send_delay = can_cfg.get('send_delay', 0.01)
+
+    can_fuzzer = CANFuzzer(
+        channel=can_channel,
+        bustype=can_bustype,
+        id_start=can_id_start,
+        id_end=can_id_end,
+        send_delay=can_send_delay
+    )
+
+    print(
+        f"[AdaptiveMain] CANFuzzer on {can_channel}/{can_bustype}, "
+        f"ID range=0x{int(can_id_start):X}-0x{int(can_id_end):X}"
+    )
+
+    # 3. 初始化自适应 fuzzer（可将参数写进 config.yaml）
+    adaptive = VisionGuidedAdaptiveFuzzer(
+        can_fuzzer=can_fuzzer,
+        detector=detector,
+        id_start=can_id_start,
+        id_end=can_id_end,
+        epsilon=0.2,
+        alpha=1.0,
+        beta=5.0,
+        default_freq_hz=10.0,
+        frames_per_episode=20,
+        settle_time=0.2,
+    )
+
+    # 4. 运行若干 episode（例如 500 个）
+    try:
+        adaptive.run(num_episodes=500)
+    finally:
+        detector.release()
+        can_fuzzer.bus.shutdown()
+
+
 
 
 if __name__ == "__main__":
-    main()
+# 调试阶段先调用 adaptive_main()
+    adaptive_main()
+    # 或根据需要保留原 main()
+    # main()
