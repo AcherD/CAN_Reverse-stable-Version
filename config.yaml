@@ -7,9 +7,9 @@ can:
   channel: "can0"
   bustype: "socketcan"
   id_start: 0x180
-  id_end: 0x189
+  id_end: 0x200
   send_delay: 0.5  # seconds
-test_hours: 9
+test_hours: 8
 error_labels: ['Anti Lock Braking System',
     'Braking System Issue',
     'Charging System Issue',

@@ -129,7 +129,7 @@ def main():
                     with open(input_file, 'r') as f:
                         lines = [line for line in f.read().splitlines() if line.strip()]
 
-                    if len(lines) < 10:
+                    if len(lines) < 8:
                         print(f"Bisect finished for {target_error}. Messages reduced to {len(lines)}.")
                         break
 
