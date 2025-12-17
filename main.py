@@ -206,12 +206,21 @@ def adaptive_main():
         detector=detector,
         id_start=can_id_start,
         id_end=can_id_end,
+        # 如果有 sniff 得到的 seed IDs，可以传进来，
+        # 没有的话可以不填，使用 [id_start, id_end] 全范围
+        # seed_ids=[0x180, 0x181, 0x182],
         epsilon=0.2,
         alpha=1.0,
         beta=5.0,
         default_freq_hz=10.0,
         frames_per_episode=20,
         settle_time=0.2,
+        min_byte_trials_for_bit=2,
+        byte_reward_threshold_for_bit=1.0,
+        neighbor_delta=0x1,
+        neighbor_reward_threshold=2.0,
+        neighbor_min_trials=5,
+        log_dir="logs"
     )
 
     # 4. 运行若干 episode（例如 500 个）
