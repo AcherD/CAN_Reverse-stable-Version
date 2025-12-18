@@ -1,4 +1,4 @@
-# adaptive_fuzzer.py
+
 import time
 import random
 import os
@@ -17,7 +17,12 @@ from VisionDetector import VisionDetector
 class VisionGuidedAdaptiveFuzzer:
     """
     Vision-guided adaptive CAN fuzzer (byte + bit exploration + neighbor expansion).
-
+    - screening + epsilon-greedy ID selection (with per-ID caps)
+    - byte-level + bit-level payload exploration
+    - ID neighborhood expansion
+    - episode- and ID-level logging
+    - bit→warning-light mapping inference
+    - PDF export of a candidate DBC-like table
     功能概述：
     - 以 CAN ID 为“臂”，使用 epsilon-greedy multi-armed bandit 进行 ID 选择；
     - 针对每个 ID，执行分阶段 payload 探索：
@@ -53,6 +58,11 @@ class VisionGuidedAdaptiveFuzzer:
         neighbor_delta: int = 0x1,
         neighbor_reward_threshold: float = 2.0,
         neighbor_min_trials: int = 5,
+        # ID selection fairness ID公平筛选
+        global_min_trials_per_id: int = 3,
+        max_trials_per_id: int = 200,
+        # vision warmup
+        vision_warmup_time: float = 2.0,
         # 日志与报告
         log_dir: str = "logs",
         # bit→灯映射统计阈值
@@ -141,6 +151,9 @@ class VisionGuidedAdaptiveFuzzer:
         self.neighbor_delta = int(neighbor_delta)
         self.neighbor_reward_threshold = float(neighbor_reward_threshold)
         self.neighbor_min_trials = int(neighbor_min_trials)
+        self.global_min_trials_per_id = int(global_min_trials_per_id)
+        self.max_trials_per_id = int(max_trials_per_id)
+        self.vision_warmup_time = float(vision_warmup_time)
         self.min_bit_events_for_mapping = int(min_bit_events_for_mapping)
         self.min_confidence_for_mapping = float(min_confidence_for_mapping)
 
@@ -185,6 +198,9 @@ class VisionGuidedAdaptiveFuzzer:
             f"initial IDs={len(self.id_candidates)}"
         )
 
+        # warm up vision (camera + model) before sending any CAN frames
+        self._warmup_vision()
+
         try:
             for ep in range(1, num_episodes + 1):
                 if self._stop_flag:
@@ -192,7 +208,7 @@ class VisionGuidedAdaptiveFuzzer:
                     break
 
                 # 1) 选择 ID（epsilon-greedy）
-                cid = self._select_id()
+                cid = self._select_id(ep)
 
                 # 2) 选 payload（byte/bit 探索）
                 payload_bytes, byte_index, bit_index = self._select_payload_for_id(cid)
@@ -252,23 +268,60 @@ class VisionGuidedAdaptiveFuzzer:
             self._save_logs_and_report()
             print("[AdaptiveFuzzer] Fuzzing finished and report generated.")
 
+    # ===== vision warmup =====
+
+    def _warmup_vision(self):
+        """
+        Warm up vision pipeline before the first CAN frames are sent.
+        """
+        if self.vision_warmup_time <= 0:
+            return
+        print(f"[AdaptiveFuzzer] Warming up vision for {self.vision_warmup_time:.1f}s...")
+        t_end = time.time() + self.vision_warmup_time
+        while time.time() < t_end:
+            try:
+                _ = self._get_light_state()
+            except Exception as e:
+                print(f"[AdaptiveFuzzer] Vision warmup error: {e}")
+                break
+            time.sleep(0.1)
     # ========== ID / payload 选择 ==========
 
-    def _select_id(self) -> int:
+    def _select_id(self, current_episode: int) -> int:
         """
-        epsilon-greedy 选择一个 CAN ID：
+        ID selection with two phases:
+        1) Screening: ensure each ID is tried at least global_min_trials_per_id times.
+        2) epsilon-greedy with per-ID max cap to avoid over-focusing on a single ID.
+
+        1) 筛选：确保每个 ID 至少尝试 global_min_trials_per_id 次。
+        2) 采用 epsilon-greedy 算法，并为每个 ID 设置最大尝试次数上限，以避免过度关注单个 ID。
         - 以概率 ε 选择“探索”：优先选择尝试次数 N 最小的 ID；
         - 以概率 (1-ε) 选择“利用”：选择当前平均 reward R 最大的 ID。
         """
-        if random.random() < self.epsilon:
-            # 探索：选择尝试次数最少的一批 ID 中的一个
-            min_N = min(stat["N"] for stat in self.id_stats.values())
+        # phase 1: screening
+        min_N = min(stat["N"] for stat in self.id_stats.values())
+        if min_N < self.global_min_trials_per_id:
+            # choose among the least-tested IDs
             candidates = [cid for cid, stat in self.id_stats.items() if stat["N"] == min_N]
             cid = random.choice(candidates)
+            return cid
+
+        # phase 2: epsilon-greedy with caps
+        # filter out IDs that already hit max_trials_per_id
+        eligible_ids = [cid for cid, stat in self.id_stats.items() if stat["N"] < self.max_trials_per_id]
+        if not eligible_ids:
+            # all IDs saturated, fall back to full set
+            eligible_ids = list(self.id_stats.keys())
+
+        if random.random() < self.epsilon:
+            # exploration: prefer IDs with smaller N within eligible set
+            min_N_elig = min(self.id_stats[cid]["N"] for cid in eligible_ids)
+            candidates = [cid for cid in eligible_ids if self.id_stats[cid]["N"] == min_N_elig]
+            cid = random.choice(candidates)
         else:
-            # 利用：选择平均 reward 最高的 ID
-            max_R = max(stat["R"] for stat in self.id_stats.values())
-            candidates = [cid for cid, stat in self.id_stats.items() if stat["R"] == max_R]
+            # exploitation: among eligible, pick highest mean reward
+            max_R = max(self.id_stats[cid]["R"] for cid in eligible_ids)
+            candidates = [cid for cid in eligible_ids if self.id_stats[cid]["R"] == max_R]
             cid = random.choice(candidates)
 
         return cid
@@ -276,7 +329,7 @@ class VisionGuidedAdaptiveFuzzer:
     def _select_payload_for_id(self, cid: int) -> Tuple[bytes, int, Optional[int]]:
         """
         针对给定 ID，根据该 ID 的探索阶段选择 payload。
-        - byte_scan 阶段：按字节扫描；
+        - byte_scan 阶段：按字节扫描，将一个字节设置为 0x01（其他字节设置为 0x00），以探测哪个字节处于活动状态；
         - bit_scan 阶段：在选定 target_byte 内按 bit 扫描。
         返回：
         - payload_bytes: bytes(8)
@@ -303,13 +356,14 @@ class VisionGuidedAdaptiveFuzzer:
         BYTE_SCAN 策略：
         1. 若还有未尝试的字节（byte_counts == 0），按顺序逐个扫描；
         2. 否则，选择平均 reward 最高的字节重复试探。
-        payload：默认全 0，仅将该字节置为 0xFF。
+        payload：默认全 0，仅将该字节置为 0x01。
         """
         byte_rewards = state["byte_rewards"]
         byte_counts = state["byte_counts"]
 
         # 第一轮扫描：优先选择尚未尝试过的字节
         if min(byte_counts) == 0:
+            # 还有未尝试过的字节
             byte_index = byte_counts.index(0)
         else:
             # 所有字节都试过：选择平均 reward 最高的字节
@@ -318,12 +372,11 @@ class VisionGuidedAdaptiveFuzzer:
             byte_index = random.choice(candidates)
 
         data = [0x00] * 8
-        data[byte_index] = 0xFF
+        data[byte_index] = 0x01  # use 0x01 instead of 0xFF
         payload_bytes = bytes(data)
 
         # 更新“下一字节”指针（仅用于信息记录，可选）
         state["next_byte"] = (byte_index + 1) % 8
-
         return payload_bytes, byte_index
 
     def _select_payload_bit_scan(self, state: Dict) -> Tuple[bytes, int, int]:
@@ -357,7 +410,6 @@ class VisionGuidedAdaptiveFuzzer:
 
         # 更新下一 bit 指针（可选）
         state["next_bit"] = (bit_index + 1) % 8
-
         return payload_bytes, target_byte, bit_index
 
     # ========== 发送报文与视觉采样 ==========
@@ -400,20 +452,19 @@ class VisionGuidedAdaptiveFuzzer:
                     self.labels.append(lbl)
             self.K = len(self.labels)
 
-        state = [0] * self.K
         label_to_idx = {lbl: idx for idx, lbl in enumerate(self.labels)}
+        state = [0] * self.K
 
         for det in detections:
             lbl = det["label"]
-            idx = label_to_idx.get(lbl)
-            if idx is None:
+            if lbl not in label_to_idx:
                 # 新 label：动态扩展
                 self.labels.append(lbl)
                 label_to_idx[lbl] = len(self.labels) - 1
                 state.append(1)
                 self.K = len(self.labels)
             else:
-                state[idx] = 1
+                state[label_to_idx[lbl]] = 1
 
         return tuple(state)
 
@@ -482,7 +533,11 @@ class VisionGuidedAdaptiveFuzzer:
         if stage == "bit_scan" and bit_index is not None and bit_index >= 0:
             bit_rewards = state["bit_rewards"]
             bit_counts = state["bit_counts"]
-            if bit_rewards is not None and bit_counts is not None and 0 <= bit_index < 8:
+            if (
+                bit_rewards is not None
+                and bit_counts is not None
+                and 0 <= bit_index < 8
+            ):
                 N_old = bit_counts[bit_index]
                 R_old = bit_rewards[bit_index]
                 N_new = N_old + 1
@@ -608,6 +663,7 @@ class VisionGuidedAdaptiveFuzzer:
         bit_stats: Dict[Tuple[int, int, int, int], Dict[str, int]] = {}
         # key: (cid, byte, bit) -> total episodes for this bit
         bit_episode_counts: Dict[Tuple[int, int, int], int] = {}
+        bit_example_payload: Dict[Tuple[int, int, int], str] = {}
 
         for rec in self.episode_log:
             if rec.get("stage") != "bit_scan":
@@ -629,6 +685,8 @@ class VisionGuidedAdaptiveFuzzer:
 
             key_bit = (cid, byte_index, bit_index)
             bit_episode_counts[key_bit] = bit_episode_counts.get(key_bit, 0) + 1
+            if key_bit not in bit_example_payload:
+                bit_example_payload[key_bit] = rec.get("payload_hex", "")
 
             for lamp_idx, (b, a) in enumerate(zip(L_before, L_after)):
                 if b == 0 and a == 1:
@@ -697,6 +755,7 @@ class VisionGuidedAdaptiveFuzzer:
                 "on_count": best_on,
                 "off_count": best_off,
                 "episodes": ep_cnt,
+                "example_payload": bit_example_payload.get((cid, byte_idx, bit_idx), ""),
             })
 
         mappings_sorted = sorted(mappings, key=lambda m: (m["id"], m["byte_index"], m["bit_index"]))
@@ -768,7 +827,7 @@ class VisionGuidedAdaptiveFuzzer:
         """
         生成易读的文本报告（.txt），方便人工 review。
         """
-        f_txt.write(f"Vision-Guided Adaptive CAN Fuzzing Report\n")
+        f_txt.write("Vision-Guided Adaptive CAN Fuzzing Report\n")
         f_txt.write(f"Run ID: {summary['run_id']}\n")
         f_txt.write(
             f"Global ID range: 0x{summary['global_id_range'][0]:03X} "
@@ -822,14 +881,18 @@ class VisionGuidedAdaptiveFuzzer:
                     f"-> {m['label']} "
                     f"({m['polarity']}, conf={m['confidence']:.2f}, "
                     f"on={m['on_count']}, off={m['off_count']}, "
-                    f"episodes={m['episodes']})\n"
+                    f"episodes={m['episodes']}, "
+                    f"example_payload={m['example_payload']})\n"
                 )
 
     def _write_pdf_dbc_table(self, summary: Dict, pdf_path: str):
         """
         用 ReportLab 将 bit_mappings 导出为 PDF 形式的“候选 DBC 表”。
+        -表 1：按 ID 汇总
+        - 表 2：比特级候选信息：（ID、字节、比特、信号标签、极性、置信度、开启次数、关闭次数、剧集数、示例有效载荷）。
         """
         bit_mappings = summary.get("bit_mappings", [])
+        id_summary = summary.get("id_summary", [])
         if not bit_mappings:
             print("[AdaptiveFuzzer] No bit mappings to export to PDF.")
             return
@@ -854,9 +917,35 @@ class VisionGuidedAdaptiveFuzzer:
         story.append(info)
         story.append(Spacer(1, 12))
 
-        # 构造表格数据
+        # table 1: per-ID summary
+        if id_summary:
+            summary_data = [["ID (hex)", "Episodes", "Mean reward", "#Patterns", "#Payload variants"]]
+            for entry in id_summary:
+                summary_data.append([
+                    entry["id_hex"],
+                    entry["episodes"],
+                    f"{entry['mean_reward']:.2f}",
+                    entry["pattern_count"],
+                    entry["payload_variants"],
+                ])
+            summary_table = Table(summary_data, repeatRows=1)
+            summary_style = TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("FONTSIZE", (0, 1), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ])
+            summary_table.setStyle(summary_style)
+            story.append(summary_table)
+            story.append(Spacer(1, 12))
+
+        # table 2: bit-level candidate mappings
         data = [["ID (hex)", "Byte", "Bit", "Signal label", "Polarity",
-                 "Confidence", "#On", "#Off", "#Episodes"]]
+                 "Confidence", "#On", "#Off", "#Episodes", "Example payload"]]
         for m in bit_mappings:
             data.append([
                 m["id_hex"],
@@ -868,6 +957,7 @@ class VisionGuidedAdaptiveFuzzer:
                 m["on_count"],
                 m["off_count"],
                 m["episodes"],
+                m["example_payload"],
             ])
 
         table = Table(data, repeatRows=1)
