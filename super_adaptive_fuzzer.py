@@ -873,31 +873,27 @@ class SuperVisionGuidedAdaptiveFuzzer:
                         f"example_payload={m['example_payload']})\n"
                     )
 
-    def _write_pdf_dbc_table(self, summary: Dict, path: str):
+    def _write_pdf_dbc_table(self, summary: Dict, path: str) -> None:
         """
-        用 ReportLab 输出一个更加可读的 PDF 报告。
+        使用 ReportLab 生成 3 页 PDF 报告：
 
-        PDF 包含两部分：
-        1) 按 ID 的整体统计（和之前类似，用于看哪个 ID 被 fuzz 得多、reward 高）；
-        2) 去重后的候选 DBC 表，按 warning light 聚合，表头形式为：
+        Page 1: 运行概览
+          - Run ID、ID 范围、总试验数、唯一灯光模式数
+          - 每个 warning light 的触发次数/覆盖率条形图
+          - 按 ID 排序的 mean_reward / pattern_count 表
 
-           | Warning Light | Candidate ID | StartBit | Length | Endian | Condition (value domain) | Evidence (per-bit stats) |
+        Page 2: 按 warning light 聚合的候选 DBC 表
+          - 每个灯：列出 1–2 个最高置信度的 (ID, StartBit, Length=1, Polarity) 候选
+          - 统一 Evidence 字段，把 F1 / 计数写清楚
 
-        实现思路（完全通用，不依赖具体题目）：
-        - 对 summary["bit_mappings"] 中的记录，先按 (lamp_index, id_hex) 聚合；
-        - 对每个 (lamp, ID) 组合，选出置信度最高的那一位 bit，作为代表性的 StartBit；
-        - 使用该 bit 的统计信息构造“Condition/Evidence”，并加上聚合置信度；
-        - 对于本轮有亮过但没找到稳定 bit 映射的灯，用 trial_log 统计亮灯次数并在表中标注。
+        Page 3: 按 ID 的 8 字节字段视图
+          - 每个高价值 ID（在 bit_mappings 中出现，按 mean_reward 排序）
+          - 画出 8 字节 × 8 bit 的示意表：
+            * 绿色：单一 label + 极性，置信度 ≥ min_confidence_for_mapping
+            * 灰色：多 label 或极性不一致的“歧义” bit
+          - 在表下方用文字列出“已识别字段”和“歧义 bits”的 StartBit/Label/Polarity 信息
         """
         from collections import defaultdict
-
-        bit_mappings = summary.get("bit_mappings", [])
-        id_summary = summary.get("id_summary", [])
-        label_mapping = summary.get("label_mapping", {})
-
-        if not bit_mappings and not id_summary:
-            print("[AdaptiveFuzzer] No data to export to PDF.")
-            return
 
         try:
             from reportlab.lib.pagesizes import A4, landscape
@@ -908,19 +904,30 @@ class SuperVisionGuidedAdaptiveFuzzer:
                 TableStyle,
                 Paragraph,
                 Spacer,
+                PageBreak,
             )
             from reportlab.lib.styles import getSampleStyleSheet
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] ReportLab not available, skip PDF export: {e}")
+            from reportlab.graphics.shapes import Drawing
+            from reportlab.graphics.charts.barcharts import VerticalBarChart
+        except Exception as e:  # pragma: no cover
+            print(f"[SuperFuzzer] ReportLab not available, skip PDF export: {e}")
+            return
+
+        bit_mappings = summary.get("bit_mappings", [])
+        id_summary = summary.get("id_summary", [])
+        label_mapping = summary.get("label_mapping", {})
+
+        if not bit_mappings and not id_summary:
+            print("[SuperFuzzer] No data to export to PDF.")
             return
 
         doc = SimpleDocTemplate(path, pagesize=landscape(A4))
         styles = getSampleStyleSheet()
         story = []
 
-        # ------------------------------------------------------------------
-        # Header
-        # ------------------------------------------------------------------
+        # ============================================================
+        # Page 1 – Overview
+        # ============================================================
         title = Paragraph(
             "Vision-Guided Adaptive CAN Fuzzing – Candidate DBC Summary",
             styles["Title"],
@@ -938,52 +945,15 @@ class SuperVisionGuidedAdaptiveFuzzer:
         story.append(Paragraph(meta_text, styles["Normal"]))
         story.append(Spacer(1, 12))
 
-        # ------------------------------------------------------------------
-        # Table 1 – per-ID statistics
-        # ------------------------------------------------------------------
-        if id_summary:
-            story.append(Paragraph("Table 1. Per-ID fuzzing statistics.", styles["Heading3"]))
-
-            data1 = [["ID (hex)", "#Trials", "Mean reward", "#Patterns"]]
-            for row in id_summary:
-                data1.append([
-                    row["id_hex"],
-                    str(row["trials"]),
-                    f"{row['mean_reward']:.2f}",
-                    str(row["pattern_count"]),
-                ])
-
-            table1 = Table(
-                data1,
-                colWidths=[60, 60, 80, 80],
-                repeatRows=1,
-            )
-            table1.setStyle(
-                TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, 0), 9),
-                    ("FONTSIZE", (0, 1), (-1, -1), 8),
-                ])
-            )
-            story.append(table1)
-            story.append(Spacer(1, 16))
-
-        # ------------------------------------------------------------------
-        # Table 2 – deduplicated bit→lamp candidates grouped by warning light
-        # ------------------------------------------------------------------
-        # 1) 统计每个灯在整轮试验中的触发次数（用于 “本轮亮过，但没找到稳定 bit” 的情况）
+        # 1.1 统计每个灯的触发次数与覆盖率，用于条形图
         label_idx_map = {int(k): v for k, v in label_mapping.items()}
         lamp_counts: Dict[int, Dict[str, int]] = {
             idx: {"on": 0, "total": 0} for idx in label_idx_map.keys()
         }
+
         for rec in self.trial_log:
             lamps_on = rec.get("lamp_on") or []
-            # 防止 CSV 反序列化变成 str，这里只接受 list[int]
+            # 理论上内存中的 lamp_on 已经是 list[int]，此处只做防御性检查
             if isinstance(lamps_on, str):
                 lamps_on = []
             for idx in lamp_counts.keys():
@@ -992,26 +962,113 @@ class SuperVisionGuidedAdaptiveFuzzer:
                 if li in lamp_counts:
                     lamp_counts[li]["on"] += 1
 
-        # 2) 将 bit_mappings 聚合到 (lamp_index, id_hex) 层级
+        if lamp_counts:
+            story.append(
+                Paragraph(
+                    "Per-warning-light coverage (trigger counts and ratios).",
+                    styles["Heading3"],
+                )
+            )
+            sorted_idx = sorted(lamp_counts.keys())
+            names = [label_idx_map[i] for i in sorted_idx]
+            counts = [lamp_counts[i]["on"] for i in sorted_idx]
+            totals = [lamp_counts[i]["total"] for i in sorted_idx]
+            coverages = [
+                (counts[i] / totals[i]) if totals[i] > 0 else 0.0
+                for i in range(len(sorted_idx))
+            ]
+
+            # 名称过长时做截断，防止覆盖
+            names_short = [
+                (n if len(n) <= 12 else n[:11] + "…") for n in names
+            ]
+            max_count = max(counts) if counts else 0
+            y_max = max(max_count, 1)
+
+            drawing = Drawing(520, 220)
+            bc = VerticalBarChart()
+            bc.x = 50
+            bc.y = 40
+            bc.height = 150
+            bc.width = 430
+            # 两条数据：counts（整数）、coverage（0–1）
+            bc.data = [counts, coverages]
+            bc.categoryAxis.categoryNames = names_short
+            bc.categoryAxis.labels.boxAnchor = "ne"
+            bc.categoryAxis.labels.angle = 45
+            bc.valueAxis.valueMin = 0
+            bc.valueAxis.valueMax = y_max
+            bc.valueAxis.valueStep = max(1, y_max // 5)
+            bc.barWidth = 8
+            bc.groupSpacing = 8
+            bc.categoryAxis.strokeColor = colors.black
+            bc.valueAxis.strokeColor = colors.black
+            drawing.add(bc)
+            story.append(drawing)
+            story.append(Spacer(1, 16))
+
+        # 1.2 Table 1 – per-ID 统计（mean_reward + pattern_count 排行）
+        if id_summary:
+            story.append(
+                Paragraph(
+                    "Table 1. Per-ID fuzzing statistics (sorted by mean reward).",
+                    styles["Heading3"],
+                )
+            )
+            data1 = [["ID (hex)", "#Trials", "Mean reward", "#Patterns"]]
+            for row in id_summary:
+                data1.append(
+                    [
+                        row["id_hex"],
+                        str(row["trials"]),
+                        f"{row['mean_reward']:.2f}",
+                        str(row["pattern_count"]),
+                    ]
+                )
+
+            table1 = Table(
+                data1, colWidths=[60, 60, 80, 80], repeatRows=1
+            )
+            table1.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, 0), 9),
+                        ("FONTSIZE", (0, 1), (-1, -1), 8),
+                    ]
+                )
+            )
+            story.append(table1)
+
+        # 换页：第二页
+        story.append(PageBreak())
+
+        # ============================================================
+        # Page 2 – 按灯的候选 bit→灯 映射表
+        # ============================================================
         grouped: Dict[Tuple[int, str], List[Dict]] = defaultdict(list)
         for m in bit_mappings:
             grouped[(m["lamp_index"], m["id_hex"])].append(m)
 
-        # 3) 构造按 warning light 聚合的候选 DBC 表
-        data2 = [[
-            "Warning Light",
-            "Candidate ID",
-            "StartBit",
-            "Length",
-            "Endian",
-            "Condition (value domain)",
-            "Evidence (per-bit stats)",
-        ]]
+        data2 = [
+            [
+                "Warning Light",
+                "Candidate ID",
+                "StartBit",
+                "Length",
+                "Endian",
+                "Condition (value domain)",
+                "Evidence (per-bit stats)",
+            ]
+        ]
 
         for idx in sorted(label_idx_map.keys()):
             lamp_name = label_idx_map[idx]
-
-            # 找出该灯对应的所有 ID 候选
             lamp_groups = {
                 id_hex: group
                 for (lamp_idx, id_hex), group in grouped.items()
@@ -1019,31 +1076,34 @@ class SuperVisionGuidedAdaptiveFuzzer:
             }
 
             if lamp_groups:
-                # 对每个 (lamp, ID) 组合，找出代表性 bit，并计算聚合置信度
                 candidates = []
                 for id_hex, group in lamp_groups.items():
+                    # 该灯-该ID 下所有 bits 的平均置信度 + 最佳 bit
                     best = max(group, key=lambda m: m["confidence"])
-                    avg_conf = sum(m["confidence"] for m in group) / max(len(group), 1)
+                    avg_conf = sum(m["confidence"] for m in group) / max(
+                        len(group), 1
+                    )
                     lamp_on_total = max(m["lamp_on_total"] for m in group)
                     sample_total = max(m["sample_total"] for m in group)
-                    candidates.append({
-                        "id_hex": id_hex,
-                        "best": best,
-                        "avg_conf": avg_conf,
-                        "lamp_on_total": lamp_on_total,
-                        "sample_total": sample_total,
-                    })
+                    candidates.append(
+                        {
+                            "id_hex": id_hex,
+                            "best": best,
+                            "avg_conf": avg_conf,
+                            "lamp_on_total": lamp_on_total,
+                            "sample_total": sample_total,
+                        }
+                    )
 
-                # 以聚合置信度排序，只展示前 1–2 个候选，避免 PDF 爆炸
+                # 按聚合置信度排序，只输出前 1–2 个候选
                 candidates.sort(key=lambda c: c["avg_conf"], reverse=True)
 
                 for rank, cand in enumerate(candidates[:2], start=1):
                     best = cand["best"]
                     pol = best["polarity"]
-
                     start_bit = best["byte_index"] * 8 + best["bit_index"]
-                    length = 1  # 目前按 bit 级别输出；多 bit 语义留给后续分析
-                    endian = "N/A"  # 暂不推断大小端，避免过度假设
+                    length = 1  # 此处按 bit 级别输出；多 bit 字段留给后续更高级分析
+                    endian = "N/A"
 
                     bit1_on = best.get("bit1_on", 0)
                     bit1_total = best.get("bit1_total", 0)
@@ -1060,36 +1120,44 @@ class SuperVisionGuidedAdaptiveFuzzer:
                         opp_on, opp_total = bit1_on, bit1_total
                     else:
                         cond_text = "bit toggle correlated with lamp"
-                        main_on, main_total = best["lamp_on_total"], best["sample_total"]
+                        main_on, main_total = (
+                            best["lamp_on_total"],
+                            best["sample_total"],
+                        )
                         opp_on, opp_total = 0, 0
 
                     evid_parts = []
                     if main_total:
-                        evid_parts.append(f"{main_on}/{main_total} on when condition")
+                        evid_parts.append(
+                            f"{main_on}/{main_total} on when condition"
+                        )
                     if opp_total:
-                        evid_parts.append(f"{opp_on}/{opp_total} on when opposite")
+                        evid_parts.append(
+                            f"{opp_on}/{opp_total} on when opposite"
+                        )
                     evid_parts.append(
                         f"conf≈{cand['avg_conf']:.2f}, "
                         f"lamp_on={cand['lamp_on_total']}/{cand['sample_total']}"
                     )
                     evidence = "; ".join(evid_parts)
 
-                    # 如果同一个灯有多个 ID 候选，在 ID 后面标上 “#1/#2” 排名
                     cid_str = cand["id_hex"]
                     if len(candidates) > 1:
                         cid_str = f"{cid_str} (#{rank})"
 
-                    data2.append([
-                        lamp_name,
-                        cid_str,
-                        str(start_bit),
-                        str(length),
-                        endian,
-                        cond_text,
-                        evidence,
-                    ])
+                    data2.append(
+                        [
+                            lamp_name,
+                            cid_str,
+                            str(start_bit),
+                            str(length),
+                            endian,
+                            cond_text,
+                            evidence,
+                        ]
+                    )
             else:
-                # 该灯在本轮中没有稳定的 bit 映射
+                # 该灯没有稳定 bit 映射，但可能曾经亮过
                 stats_l = lamp_counts.get(idx, {"on": 0, "total": 0})
                 on = stats_l["on"]
                 total = stats_l["total"]
@@ -1102,46 +1170,238 @@ class SuperVisionGuidedAdaptiveFuzzer:
                 else:
                     cond_text = "–"
                     evidence = "Not triggered in this run."
-                data2.append([
-                    lamp_name,
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    cond_text,
-                    evidence,
-                ])
+                data2.append(
+                    [lamp_name, "-", "-", "-", "-", cond_text, evidence]
+                )
 
-        story.append(Paragraph(
-            "Table 2. Candidate bit-to-warning-light mappings "
-            "(deduplicated, grouped by lamp).",
-            styles["Heading3"],
-        ))
-
+        story.append(
+            Paragraph(
+                "Table 2. Candidate bit-to-warning-light mappings "
+                "(deduplicated, grouped by lamp).",
+                styles["Heading3"],
+            )
+        )
         table2 = Table(
             data2,
             colWidths=[120, 70, 50, 50, 50, 160, 220],
             repeatRows=1,
         )
         table2.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 9),
-                ("FONTSIZE", (0, 1), (-1, -1), 7),
-            ])
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("FONTSIZE", (0, 1), (-1, -1), 7),
+                ]
+            )
         )
         story.append(table2)
 
+        # 换页：第三页
+        story.append(PageBreak())
+
+        # ============================================================
+        # Page 3 – 按 ID 的 8 字节字段视图
+        # ============================================================
+        story.append(
+            Paragraph(
+                "Table 3. High-value CAN IDs – byte/bit field view "
+                "derived from bit-level mappings.",
+                styles["Heading3"],
+            )
+        )
+        story.append(Spacer(1, 8))
+
+        # 3.1 汇总当前所有 bit 映射到 per-ID / per-bit 的结构
+        per_id_bits: Dict[str, Dict[Tuple[int, int], List[Dict]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for m in bit_mappings:
+            per_id_bits[m["id_hex"]][(m["byte_index"], m["bit_index"])].append(m)
+
+        # 用 per-ID mean_reward 作为“高价值 ID”排序依据
+        id_reward_map = {row["id_hex"]: row["mean_reward"] for row in id_summary}
+        ids_with_bits = list(per_id_bits.keys())
+        ids_with_bits.sort(key=lambda hx: -id_reward_map.get(hx, 0.0))
+
+        for id_hex in ids_with_bits:
+            bitinfo = per_id_bits[id_hex]
+
+            story.append(
+                Paragraph(
+                    f"ID {id_hex} – inferred byte/bit layout",
+                    styles["Heading4"],
+                )
+            )
+
+            header_row = ["Byte", "b7", "b6", "b5", "b4", "b3", "b2", "b1", "b0"]
+            table_data = [header_row]
+            cell_styles = []
+
+            recognized_fields: List[Dict] = []
+            ambiguous_bits: List[Dict] = []
+
+            # 按 Byte7 → Byte0 输出，方便人眼查看 bit 位置
+            for byte_idx in reversed(range(8)):
+                row = [f"Byte{byte_idx}"]
+                for bit_idx in reversed(range(8)):  # b7..b0
+                    key = (byte_idx, bit_idx)
+                    maps = bitinfo.get(key, [])
+                    if not maps:
+                        row.append("-")
+                        continue
+
+                    labels = sorted({m["label"] for m in maps})
+                    pols = {m["polarity"] for m in maps}
+                    avg_conf = sum(m["confidence"] for m in maps) / max(
+                        len(maps), 1
+                    )
+                    start_bit = byte_idx * 8 + bit_idx
+
+                    # 判定：稳定单一 label + 单一极性 + 置信度达阈值 → 认定为“已识别字段”
+                    if (
+                            len(labels) == 1
+                            and len(pols) == 1
+                            and avg_conf
+                            >= getattr(self, "min_confidence_for_mapping", 0.6)
+                    ):
+                        recognized_fields.append(
+                            {
+                                "start_bit": start_bit,
+                                "length": 1,
+                                "labels": labels,
+                                "polarity": list(pols)[0],
+                                "avg_conf": avg_conf,
+                            }
+                        )
+                    else:
+                        ambiguous_bits.append(
+                            {
+                                "start_bit": start_bit,
+                                "labels": labels,
+                                "polarity_set": list(pols),
+                                "avg_conf": avg_conf,
+                            }
+                        )
+
+                    label_str = "/".join(labels) if labels else "?"
+                    pol_tag = (
+                        "H"
+                        if "active_high" in pols
+                        else ("L" if "active_low" in pols else "?")
+                    )
+                    cell_text = f"{label_str}({pol_tag},{avg_conf:.2f})"
+                    if len(cell_text) > 18:
+                        cell_text = cell_text[:17] + "…"
+                    row.append(cell_text)
+                table_data.append(row)
+
+            # header 样式
+            for c in range(9):
+                cell_styles.append(
+                    ("BACKGROUND", (c, 0), (c, 0), colors.lightgrey)
+                )
+                cell_styles.append(
+                    ("TEXTCOLOR", (c, 0), (c, 0), colors.black)
+                )
+                cell_styles.append(
+                    ("FONTNAME", (c, 0), (c, 0), "Helvetica-Bold")
+                )
+                cell_styles.append(("FONTSIZE", (c, 0), (c, 0), 7))
+
+            # 数据单元格背景色：绿色=已识别字段；灰色=歧义；白色=未使用
+            for r in range(1, len(table_data)):
+                for c in range(1, 9):
+                    text = table_data[r][c]
+                    if text == "-":
+                        bg = colors.whitesmoke
+                    elif "/" in text:
+                        bg = colors.lightgrey  # 多 label，视为歧义
+                    else:
+                        bg = colors.lightgreen  # 单 label，视为已识别字段
+                    cell_styles.append(
+                        ("BACKGROUND", (c, r), (c, r), bg)
+                    )
+                    cell_styles.append(("FONTSIZE", (c, r), (c, r), 6))
+
+            cell_styles.append(
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.grey)
+            )
+            cell_styles.append(
+                ("ALIGN", (0, 0), (-1, -1), "CENTER")
+            )
+            cell_styles.append(
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE")
+            )
+
+            t = Table(table_data, colWidths=[40] + [60] * 8)
+            t.setStyle(TableStyle(cell_styles))
+            story.append(t)
+            story.append(Spacer(1, 4))
+
+            # 该 ID 的“已识别字段”文字总结
+            if recognized_fields:
+                lines = []
+                for fld in sorted(
+                        recognized_fields, key=lambda f: f["start_bit"]
+                ):
+                    labels_str = "/".join(fld["labels"])
+                    pol = fld["polarity"]
+                    lines.append(
+                        f"StartBit {fld['start_bit']}, "
+                        f"Len={fld['length']}, "
+                        f"Label(s): {labels_str}, "
+                        f"Polarity: {pol}, "
+                        f"avg_conf≈{fld['avg_conf']:.2f}"
+                    )
+                txt = "Recognized single-bit fields: " + "; ".join(lines)
+            else:
+                txt = (
+                    "Recognized single-bit fields: "
+                    "(none above confidence threshold)."
+                )
+            story.append(Paragraph(txt, styles["Normal"]))
+
+            # “歧义 bits” 文字总结（灰色单元格）
+            if ambiguous_bits:
+                lines = []
+                for ab in sorted(
+                        ambiguous_bits, key=lambda a: a["start_bit"]
+                ):
+                    if not ab["labels"]:
+                        continue
+                    labels_str = "/".join(ab["labels"])
+                    pols = (
+                        ",".join(ab["polarity_set"])
+                        if ab["polarity_set"]
+                        else "?"
+                    )
+                    lines.append(
+                        f"{ab['start_bit']} ({labels_str}, "
+                        f"pol={pols}, conf≈{ab['avg_conf']:.2f})"
+                    )
+                if lines:
+                    txt2 = (
+                            "Ambiguous bits (grey cells): " + "; ".join(lines)
+                    )
+                else:
+                    txt2 = "Ambiguous bits (grey cells): none."
+            else:
+                txt2 = "Ambiguous bits (grey cells): none."
+            story.append(Paragraph(txt2, styles["Normal"]))
+            story.append(Spacer(1, 8))
+
+        # 生成 PDF
         try:
             doc.build(story)
-            print(f"[AdaptiveFuzzer] DBC candidate PDF written to {path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to build PDF: {e}")
+            print(f"[SuperFuzzer] DBC candidate PDF written to {path}")
+        except Exception as e:  # pragma: no cover
+            print(f"[SuperFuzzer] Failed to build PDF: {e}")
 
     def _save_logs_and_report(self) -> None:
         """Dump per-trial CSV, JSON summary, text report, and PDF DBC table."""
