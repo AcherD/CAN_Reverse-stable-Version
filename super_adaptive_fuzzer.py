@@ -873,12 +873,30 @@ class SuperVisionGuidedAdaptiveFuzzer:
                         f"example_payload={m['example_payload']})\n"
                     )
 
-    def _write_pdf_dbc_table(self, summary: Dict, path: str) -> None:
-        """Write ID-level summary and bit→lamp candidate table into a PDF."""
+    def _write_pdf_dbc_table(self, summary: Dict, path: str):
+        """
+        用 ReportLab 输出一个更加可读的 PDF 报告。
+
+        PDF 包含两部分：
+        1) 按 ID 的整体统计（和之前类似，用于看哪个 ID 被 fuzz 得多、reward 高）；
+        2) 去重后的候选 DBC 表，按 warning light 聚合，表头形式为：
+
+           | Warning Light | Candidate ID | StartBit | Length | Endian | Condition (value domain) | Evidence (per-bit stats) |
+
+        实现思路（完全通用，不依赖具体题目）：
+        - 对 summary["bit_mappings"] 中的记录，先按 (lamp_index, id_hex) 聚合；
+        - 对每个 (lamp, ID) 组合，选出置信度最高的那一位 bit，作为代表性的 StartBit；
+        - 使用该 bit 的统计信息构造“Condition/Evidence”，并加上聚合置信度；
+        - 对于本轮有亮过但没找到稳定 bit 映射的灯，用 trial_log 统计亮灯次数并在表中标注。
+        """
+        from collections import defaultdict
+
         bit_mappings = summary.get("bit_mappings", [])
         id_summary = summary.get("id_summary", [])
+        label_mapping = summary.get("label_mapping", {})
+
         if not bit_mappings and not id_summary:
-            print("[SuperFuzzer] No data to export to PDF.")
+            print("[AdaptiveFuzzer] No data to export to PDF.")
             return
 
         try:
@@ -892,118 +910,238 @@ class SuperVisionGuidedAdaptiveFuzzer:
                 Spacer,
             )
             from reportlab.lib.styles import getSampleStyleSheet
-        except Exception as exc:  # pragma: no cover
-            print(f"[SuperFuzzer] ReportLab not available, skip PDF export: {exc}")
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] ReportLab not available, skip PDF export: {e}")
             return
 
         doc = SimpleDocTemplate(path, pagesize=landscape(A4))
         styles = getSampleStyleSheet()
         story = []
 
+        # ------------------------------------------------------------------
+        # Header
+        # ------------------------------------------------------------------
         title = Paragraph(
-            "Vision-Guided Candidate DBC Table (Bit-to-Warning-Light Mapping)",
+            "Vision-Guided Adaptive CAN Fuzzing – Candidate DBC Summary",
             styles["Title"],
         )
-        info = Paragraph(f"Run ID: {summary['run_id']}", styles["Normal"])
         story.append(title)
-        story.append(Spacer(1, 6))
-        story.append(info)
+        story.append(Spacer(1, 8))
+
+        meta_text = (
+            f"Run ID: {summary.get('run_id', '')} &nbsp;&nbsp; "
+            f"ID range: 0x{summary['global_id_range'][0]:03X}"
+            f"–0x{summary['global_id_range'][1]:03X} &nbsp;&nbsp; "
+            f"Total trials: {summary.get('total_trials', 0)} &nbsp;&nbsp; "
+            f"Unique light patterns: {summary.get('unique_patterns', 0)}"
+        )
+        story.append(Paragraph(meta_text, styles["Normal"]))
         story.append(Spacer(1, 12))
 
-        # Table 1: per-ID summary
+        # ------------------------------------------------------------------
+        # Table 1 – per-ID statistics
+        # ------------------------------------------------------------------
         if id_summary:
-            data1 = [["ID (hex)", "Trials", "Mean reward", "#Patterns"]]
-            for entry in id_summary:
-                data1.append(
-                    [
-                        entry["id_hex"],
-                        entry["trials"],
-                        f"{entry['mean_reward']:.2f}",
-                        entry["pattern_count"],
-                    ]
-                )
-            table1 = Table(data1, repeatRows=1)
-            style1 = TableStyle(
-                [
+            story.append(Paragraph("Table 1. Per-ID fuzzing statistics.", styles["Heading3"]))
+
+            data1 = [["ID (hex)", "#Trials", "Mean reward", "#Patterns"]]
+            for row in id_summary:
+                data1.append([
+                    row["id_hex"],
+                    str(row["trials"]),
+                    f"{row['mean_reward']:.2f}",
+                    str(row["pattern_count"]),
+                ])
+
+            table1 = Table(
+                data1,
+                colWidths=[60, 60, 80, 80],
+                repeatRows=1,
+            )
+            table1.setStyle(
+                TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("FONTSIZE", (0, 0), (-1, 0), 9),
                     ("FONTSIZE", (0, 1), (-1, -1), 8),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ]
+                ])
             )
-            table1.setStyle(style1)
             story.append(table1)
-            story.append(Spacer(1, 12))
+            story.append(Spacer(1, 16))
 
-        # Table 2: bit→lamp candidate DBC (grouped by warning light)
-        if bit_mappings:
-            sorted_bits = sorted(
-                bit_mappings,
-                key=lambda m: (
-                    m["label"],
-                    m["id_hex"],
-                    m["byte_index"],
-                    m["bit_index"],
-                ),
-            )
+        # ------------------------------------------------------------------
+        # Table 2 – deduplicated bit→lamp candidates grouped by warning light
+        # ------------------------------------------------------------------
+        # 1) 统计每个灯在整轮试验中的触发次数（用于 “本轮亮过，但没找到稳定 bit” 的情况）
+        label_idx_map = {int(k): v for k, v in label_mapping.items()}
+        lamp_counts: Dict[int, Dict[str, int]] = {
+            idx: {"on": 0, "total": 0} for idx in label_idx_map.keys()
+        }
+        for rec in self.trial_log:
+            lamps_on = rec.get("lamp_on") or []
+            # 防止 CSV 反序列化变成 str，这里只接受 list[int]
+            if isinstance(lamps_on, str):
+                lamps_on = []
+            for idx in lamp_counts.keys():
+                lamp_counts[idx]["total"] += 1
+            for li in lamps_on:
+                if li in lamp_counts:
+                    lamp_counts[li]["on"] += 1
 
-            data2 = [
-                [
-                    "Warning light",
-                    "ID (hex)",
-                    "Byte",
-                    "Bit",
-                    "Polarity",
-                    "Confidence",
-                    "#LampOn",
-                    "#Bit=1 & LampOn",
-                    "#Bit=1 total",
-                    "#Bit=0 & LampOn",
-                    "#Bit=0 total",
-                    "Example payload",
-                ]
-            ]
+        # 2) 将 bit_mappings 聚合到 (lamp_index, id_hex) 层级
+        grouped: Dict[Tuple[int, str], List[Dict]] = defaultdict(list)
+        for m in bit_mappings:
+            grouped[(m["lamp_index"], m["id_hex"])].append(m)
 
-            for m in sorted_bits:
-                data2.append(
-                    [
-                        m["label"],
-                        m["id_hex"],
-                        m["byte_index"],
-                        m["bit_index"],
-                        m["polarity"],
-                        f"{m['confidence']:.2f}",
-                        m["lamp_on_total"],
-                        m["bit1_on"],
-                        m["bit1_total"],
-                        m["bit0_on"],
-                        m["bit0_total"],
-                        m["example_payload"],
-                    ]
-                )
+        # 3) 构造按 warning light 聚合的候选 DBC 表
+        data2 = [[
+            "Warning Light",
+            "Candidate ID",
+            "StartBit",
+            "Length",
+            "Endian",
+            "Condition (value domain)",
+            "Evidence (per-bit stats)",
+        ]]
 
-            table2 = Table(data2, repeatRows=1)
-            style2 = TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, 0), 9),
-                    ("FONTSIZE", (0, 1), (-1, -1), 7),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ]
-            )
-            table2.setStyle(style2)
-            story.append(table2)
+        for idx in sorted(label_idx_map.keys()):
+            lamp_name = label_idx_map[idx]
 
-        doc.build(story)
-        print(f"[SuperFuzzer] DBC candidate PDF written to {path}")
+            # 找出该灯对应的所有 ID 候选
+            lamp_groups = {
+                id_hex: group
+                for (lamp_idx, id_hex), group in grouped.items()
+                if lamp_idx == idx
+            }
+
+            if lamp_groups:
+                # 对每个 (lamp, ID) 组合，找出代表性 bit，并计算聚合置信度
+                candidates = []
+                for id_hex, group in lamp_groups.items():
+                    best = max(group, key=lambda m: m["confidence"])
+                    avg_conf = sum(m["confidence"] for m in group) / max(len(group), 1)
+                    lamp_on_total = max(m["lamp_on_total"] for m in group)
+                    sample_total = max(m["sample_total"] for m in group)
+                    candidates.append({
+                        "id_hex": id_hex,
+                        "best": best,
+                        "avg_conf": avg_conf,
+                        "lamp_on_total": lamp_on_total,
+                        "sample_total": sample_total,
+                    })
+
+                # 以聚合置信度排序，只展示前 1–2 个候选，避免 PDF 爆炸
+                candidates.sort(key=lambda c: c["avg_conf"], reverse=True)
+
+                for rank, cand in enumerate(candidates[:2], start=1):
+                    best = cand["best"]
+                    pol = best["polarity"]
+
+                    start_bit = best["byte_index"] * 8 + best["bit_index"]
+                    length = 1  # 目前按 bit 级别输出；多 bit 语义留给后续分析
+                    endian = "N/A"  # 暂不推断大小端，避免过度假设
+
+                    bit1_on = best.get("bit1_on", 0)
+                    bit1_total = best.get("bit1_total", 0)
+                    bit0_on = best.get("bit0_on", 0)
+                    bit0_total = best.get("bit0_total", 0)
+
+                    if pol == "active_high":
+                        cond_text = "bit == 1 (active_high)"
+                        main_on, main_total = bit1_on, bit1_total
+                        opp_on, opp_total = bit0_on, bit0_total
+                    elif pol == "active_low":
+                        cond_text = "bit == 0 (active_low)"
+                        main_on, main_total = bit0_on, bit0_total
+                        opp_on, opp_total = bit1_on, bit1_total
+                    else:
+                        cond_text = "bit toggle correlated with lamp"
+                        main_on, main_total = best["lamp_on_total"], best["sample_total"]
+                        opp_on, opp_total = 0, 0
+
+                    evid_parts = []
+                    if main_total:
+                        evid_parts.append(f"{main_on}/{main_total} on when condition")
+                    if opp_total:
+                        evid_parts.append(f"{opp_on}/{opp_total} on when opposite")
+                    evid_parts.append(
+                        f"conf≈{cand['avg_conf']:.2f}, "
+                        f"lamp_on={cand['lamp_on_total']}/{cand['sample_total']}"
+                    )
+                    evidence = "; ".join(evid_parts)
+
+                    # 如果同一个灯有多个 ID 候选，在 ID 后面标上 “#1/#2” 排名
+                    cid_str = cand["id_hex"]
+                    if len(candidates) > 1:
+                        cid_str = f"{cid_str} (#{rank})"
+
+                    data2.append([
+                        lamp_name,
+                        cid_str,
+                        str(start_bit),
+                        str(length),
+                        endian,
+                        cond_text,
+                        evidence,
+                    ])
+            else:
+                # 该灯在本轮中没有稳定的 bit 映射
+                stats_l = lamp_counts.get(idx, {"on": 0, "total": 0})
+                on = stats_l["on"]
+                total = stats_l["total"]
+                if on > 0:
+                    cond_text = "–"
+                    evidence = (
+                        f"Triggered {on} times in {total} trials, "
+                        f"but no stable bit-level mapping detected."
+                    )
+                else:
+                    cond_text = "–"
+                    evidence = "Not triggered in this run."
+                data2.append([
+                    lamp_name,
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    cond_text,
+                    evidence,
+                ])
+
+        story.append(Paragraph(
+            "Table 2. Candidate bit-to-warning-light mappings "
+            "(deduplicated, grouped by lamp).",
+            styles["Heading3"],
+        ))
+
+        table2 = Table(
+            data2,
+            colWidths=[120, 70, 50, 50, 50, 160, 220],
+            repeatRows=1,
+        )
+        table2.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("FONTSIZE", (0, 1), (-1, -1), 7),
+            ])
+        )
+        story.append(table2)
+
+        try:
+            doc.build(story)
+            print(f"[AdaptiveFuzzer] DBC candidate PDF written to {path}")
+        except Exception as e:
+            print(f"[AdaptiveFuzzer] Failed to build PDF: {e}")
 
     def _save_logs_and_report(self) -> None:
         """Dump per-trial CSV, JSON summary, text report, and PDF DBC table."""
