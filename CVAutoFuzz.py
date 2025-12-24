@@ -201,7 +201,7 @@ class CVAutoFuzz:
             return hit
         else:
             # 没指定目标（如第一轮Fuzz），只要有任意错误就返回True
-            has_error = (len(error_labels = []) > 0)
+            has_error = (len(error_labels) > 0)
             return has_error
 
     def generate_error_report(self, labels: list, file_path: str):

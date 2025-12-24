@@ -14,17 +14,19 @@ from VisionDetector import VisionDetector
 
 
 class SuperVisionGuidedAdaptiveFuzzer:
-    """
-    Vision-guided adaptive CAN fuzzer.
+    """Vision-guided adaptive CAN fuzzer (super version).
 
-    关键特点：
-    - ID 选择：全局覆盖 + epsilon-greedy bandit（带单 ID 最大尝试数）
-    - 单 ID 试验：baseline payload vs mutated payload 成对对比
-    - payload：结构化随机（全随机、稀疏激活、围绕高价值 payload 微调）
-    - 时间窗口：mutated payload 默认连续发送多帧（有利于触发“3 次/2s”之类的条件）
-    - bit→灯 映射：基于 baseline→mutated 过程中“变动位”和“灯变化”的统计
-    - 多 ID 组合：周期性组合多个已知“有趣事件”来尝试触发 Master Warning 等多 ID 故障灯
-    - 实验结束后输出：episodes.csv + summary.json + summary.txt + dbc_candidates.pdf
+    Generic design (no hard-coded ID semantics):
+    - Online: use epsilon-greedy multi-armed bandit with vision feedback
+      to choose IDs and payloads, maximizing warning-light coverage;
+    - Support both single-ID and multi-ID / temporal conditions via:
+      * per-episode lamp reset + detection within the 0.5 s window;
+      * periodic multi-ID combo trials composed from prior high-reward events;
+    - Offline: build statistical bit→light mappings and output a
+      candidate DBC table, grouped by warning light, into a PDF report.
+
+    The implementation does not special-case any particular CAN ID;
+    everything is driven by statistics and bandit dynamics.
     """
 
     def __init__(
@@ -33,139 +35,120 @@ class SuperVisionGuidedAdaptiveFuzzer:
         detector: VisionDetector,
         id_start: int,
         id_end: int,
-        seed_ids: Optional[List[int]] = None,
         # bandit & reward
         epsilon: float = 0.2,
         alpha: float = 1.0,
         beta: float = 5.0,
-        # CAN 发送与时序
-        default_freq_hz: float = 20.0,   # 建议稍微提一点频率
-        baseline_repeats: int = 0,       # 后面会不再使用 baseline 帧
+        # CAN sending & timing
+        default_freq_hz: float = 20.0,
+        baseline_repeats: int = 0,
         mutated_repeats: int = 3,
-        settle_time: float = 0.05,       # 现在当作 detection_delay 使用
-        lamp_reset_time: float = 0.6,    # 新增：灯自动熄灭时间 + 安全裕量
-        # ID 覆盖约束
+        settle_time: float = 0.1,
+        lamp_reset_time: float = 0.6,
+        # ID coverage constraints
         global_min_trials_per_id: int = 5,
         max_trials_per_id: int = 500,
-        # 邻域扩展
+        # neighbor expansion
         neighbor_delta: int = 1,
-        neighbor_reward_threshold: float = 1.0,
         neighbor_min_trials: int = 10,
-        # 多 ID 组合试验
+        neighbor_reward_threshold: float = 1.0,
+        # multi-ID combo
         multi_combo_period: int = 50,
         min_events_for_combo: int = 3,
-        # 视觉 warmup
+        # vision warmup
         vision_warmup_time: float = 2.0,
-        # bit→灯 映射阈值
+        # bit→lamp mapping thresholds
         min_bit_events_for_mapping: int = 5,
         min_confidence_for_mapping: float = 0.6,
-        # 日志目录
-        log_dir: str = "logs",
+        # logging
+        log_dir: str = "logsSuper",
     ):
+        # core objects
         self.can_fuzzer = can_fuzzer
         self.detector = detector
 
-        self.settle_time = float(settle_time)  # 现在把它当作 detection_delay
-        self.lamp_reset_time = float(lamp_reset_time) # 两组报文之间的最小等待
-
-        # ID 范围 & 初始候选集
+        # ID range
         self.id_min = int(id_start)
         self.id_max = int(id_end)
+        if self.id_min > self.id_max:
+            self.id_min, self.id_max = self.id_max, self.id_min
+        self.id_candidates: List[int] = list(range(self.id_min, self.id_max + 1))
 
-        if seed_ids:
-            self.id_candidates: List[int] = sorted(
-                cid for cid in set(int(x) for x in seed_ids)
-                if self.id_min <= cid <= self.id_max
-            )
-        else:
-            self.id_candidates = list(range(self.id_min, self.id_max + 1))
-
-        # 每个 ID 的 bandit 统计
+        # per-ID bandit stats
         self.id_stats: Dict[int, Dict[str, float]] = {
             cid: {"R": 0.0, "N": 0.0} for cid in self.id_candidates
         }
 
-        # 视觉 labels（YOLO 的类名）
+        # vision labels (may grow dynamically)
         self.labels: List[str] = getattr(detector, "labels", [])
         self.K: int = len(self.labels)
 
-        # baseline payload（全 0）
+        # conceptual baseline payload (not necessarily sent)
         self.baseline_payload: bytes = bytes([0x00] * 8)
 
-        # 覆盖与日志
-        self.coverage = set()  # set of tuples(light_state)
+        # coverage
+        self.coverage = set()  # set of tuple(light_state)
         self.id_patterns: Dict[int, set] = defaultdict(set)
 
-        self.trial_log: List[Dict] = []  # 每个“试验”一条记录（single or multi）
-        self.interesting_events: List[Dict] = []  # 单 ID 中发现有灯变化的“高价值事件”
+        # episode-level log & interesting events
+        self.trial_log: List[Dict] = []
+        self.interesting_events: List[Dict] = []
         self.id_best_payloads: Dict[int, List[bytes]] = defaultdict(list)
-
-        # multi-ID 组合统计（仅用于报告）
         self.multi_combo_events: List[Dict] = []
 
-        # bandit & reward 参数
+        # bandit & reward parameters
         self.epsilon = float(epsilon)
         self.alpha = float(alpha)
         self.beta = float(beta)
 
-        # 发送与时间参数
+        # sending & timing
         self.default_freq_hz = float(default_freq_hz)
         self.baseline_repeats = int(baseline_repeats)
         self.mutated_repeats = int(mutated_repeats)
+        # settle_time controls detection delay after sending payload
         self.settle_time = float(settle_time)
+        # lamp_reset_time should be >= cluster auto-off (0.5 s) to avoid cross-episode interference
+        self.lamp_reset_time = float(lamp_reset_time)
 
-        # 覆盖与 bandit 限制
+        # coverage & bandit limits
         self.global_min_trials_per_id = int(global_min_trials_per_id)
         self.max_trials_per_id = int(max_trials_per_id)
 
-        # 邻域扩展
+        # neighbor expansion
         self.neighbor_delta = int(neighbor_delta)
         self.neighbor_reward_threshold = float(neighbor_reward_threshold)
         self.neighbor_min_trials = int(neighbor_min_trials)
         self.neighbor_expanded_ids = set()
 
-        # 多 ID 组合参数
+        # multi-ID combo
         self.multi_combo_period = int(multi_combo_period)
         self.min_events_for_combo = int(min_events_for_combo)
 
-        # 视觉 warmup
+        # vision warmup
         self.vision_warmup_time = float(vision_warmup_time)
 
-        # bit 映射阈值
+        # bit mapping thresholds
         self.min_bit_events_for_mapping = int(min_bit_events_for_mapping)
         self.min_confidence_for_mapping = float(min_confidence_for_mapping)
 
-        # 日志路径
+        # logging
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         self._stop_flag = False
 
-    # ===================== 公共接口 =====================
+    # ===================== public API =====================
 
     def stop(self):
-        """允许外部提前终止 run 循环。"""
+        """Allow external code to stop the main loop."""
         self._stop_flag = True
 
-    def _wait_lamps_reset(self):
-        """
-        等待仪表盘上的灯自然熄灭。
-        固定 sleep lamp_reset_time。
-        也可以改成“循环检测直到所有灯都为 0 或超时”。
-        """
-        time.sleep(self.lamp_reset_time)
-
-
     def run(self, num_episodes: int = 5000):
-        """
-        主循环：执行 num_episodes 个“试验 episode”。
-        每个 episode 要么是单 ID baseline vs mutated 试验，要么是多 ID 组合试验。
-        """
+        """Main loop: run num_episodes single or multi-ID trials."""
         print(
-            f"[AdaptiveFuzzer] Start fuzzing: {num_episodes} episodes, "
-            f"ID range 0x{self.id_min:X}-0x{self.id_max:X}, "
-            f"initial IDs={len(self.id_candidates)}"
+            f"[SuperFuzzer] Start fuzzing: {num_episodes} episodes, "
+            f"ID range 0x{self.id_min:X}-0x{self.id_max:X}"
         )
 
         self._warmup_vision()
@@ -173,76 +156,76 @@ class SuperVisionGuidedAdaptiveFuzzer:
         try:
             for ep in range(1, num_episodes + 1):
                 if self._stop_flag:
-                    print(f"[AdaptiveFuzzer] Stopped externally at episode {ep}.")
+                    print(f"[SuperFuzzer] Stopped externally at episode {ep}.")
                     break
 
-                # 周期性进行 multi-ID 组合尝试，用于触发 Master Warning 等
+                # periodic multi-ID combo to explore cross-ID / temporal semantics
                 if (
                     self.multi_combo_period > 0
                     and ep % self.multi_combo_period == 0
                     and len(self.interesting_events) >= self.min_events_for_combo
                 ):
                     self._run_multi_id_combo_trial(ep)
-                    continue
-
-                # 常规：单 ID baseline vs mutated 试验
-                self._run_single_id_trial(ep)
-
+                else:
+                    self._run_single_id_trial(ep)
         finally:
             self._save_logs_and_report()
-            print("[AdaptiveFuzzer] Fuzzing finished, logs & report generated.")
+            print("[SuperFuzzer] Fuzzing finished, logs & report generated.")
 
-    # ===================== 视觉 warmup =====================
+    # ===================== vision warmup & lamp reset =====================
 
     def _warmup_vision(self):
-        """在第一次发送 CAN 报文前预热摄像头和模型。"""
         if self.vision_warmup_time <= 0:
             return
-        print(f"[AdaptiveFuzzer] Warming up vision for {self.vision_warmup_time:.1f} s...")
+        print(f"[SuperFuzzer] Warming up vision for {self.vision_warmup_time:.1f} s...")
         end_t = time.time() + self.vision_warmup_time
         while time.time() < end_t:
             try:
                 _ = self._get_light_state()
-            except Exception as e:
-                print(f"[AdaptiveFuzzer] Vision warmup error: {e}")
+            except Exception as exc:  # pragma: no cover
+                print(f"[SuperFuzzer] Vision warmup error: {exc}")
                 break
             time.sleep(0.1)
 
-    # ===================== 单 ID 试验（核心） =====================
+    def _wait_lamps_reset(self):
+        """Wait for warning lights to naturally turn off."""
+        time.sleep(self.lamp_reset_time)
+
+    # ===================== single-ID trial =====================
 
     def _run_single_id_trial(self, ep: int):
         cid = self._select_id()
 
-        # 1) 等待灯灭 + baseline 视觉
+        # 1) reset lights and capture baseline state
         self._wait_lamps_reset()
-        L0 = self._get_light_state()  # 此时应该是全 0 或稳定状态
+        L0 = self._get_light_state()
 
-        # 2) mutated 报文：直接向该 ID 注入 payload
+        # 2) generate mutated payload and send frames for this ID
         M = self._generate_mutated_payload(cid)
         self._send_frames(cid, M, repeats=self.mutated_repeats)
 
-        # 短暂等待，让仪表有时间刷新，但保证在 0.5s 内
+        # ensure detection happens within ~0.5 s auto-off window
         time.sleep(self.settle_time)
         L1 = self._get_light_state()
 
-        # 3) reward & 灯变化
+        # 3) compute reward & light changes
         reward, changed_cnt, is_new, lamp_on, lamp_off = self._compute_reward(L0, L1)
 
-        # 4) 更新 bandit 和邻域
+        # 4) bandit update & neighbor expansion
         self._update_bandit(cid, reward)
         self.id_patterns[cid].add(L1)
         self._maybe_expand_neighbors(cid)
 
-        # 5) 记录有趣事件（用于 bit 映射与 multi-ID 组合）
-        self._register_interesting_event(cid, M, reward, lamp_on, lamp_off)
+        # 5) register interesting event for later multi-ID combos & bit mapping
+        self._register_interesting_event(ep, cid, M, reward, lamp_on, lamp_off)
 
-        # 6) 日志记录
+        # 6) episode-level log
         rec = {
             "episode": ep,
             "type": "single",
             "id": cid,
             "id_hex": f"0x{cid:03X}",
-            "baseline_payload": self.baseline_payload.hex(),  # 概念上的全 0 baseline
+            "baseline_payload": self.baseline_payload.hex(),
             "mut_payload": M.hex(),
             "reward": float(reward),
             "changed_cnt": int(changed_cnt),
@@ -255,40 +238,70 @@ class SuperVisionGuidedAdaptiveFuzzer:
         self.trial_log.append(rec)
 
         print(
-            f"[EP {ep:04d}] single ID=0x{cid:03X}, "
-            f"mut={M.hex()}, Δlights={changed_cnt}, new={is_new}, "
+            f"[EP {ep:04d}] single ID=0x{cid:03X}, mut={M.hex()}, "
+            f"Δlights={changed_cnt}, new={is_new}, "
             f"R_id={self.id_stats[cid]['R']:.2f}, N_id={int(self.id_stats[cid]['N'])}"
         )
 
-    # ===================== 多 ID 组合试验（Master Warning 等） =====================
+    # ===================== multi-ID combo trial =====================
 
     def _run_multi_id_combo_trial(self, ep: int):
+        """Run a multi-ID combo trial using previously interesting events."""
         if len(self.interesting_events) < self.min_events_for_combo:
             return
 
-        events = random.sample(
-            self.interesting_events,
-            k=min(3, len(self.interesting_events))
-        )
+        # group events by warning-light labels (from vision)
+        label_to_events: Dict[str, List[Dict]] = defaultdict(list)
+        for ev in self.interesting_events:
+            for lbl in ev.get("labels", []):
+                label_to_events[lbl].append(ev)
 
-        # 1) 确保起点灯状态干净
+        # count per-light occurrences to prefer rare lights in combos
+        lamp_counts: Dict[str, int] = {
+            lbl: len(evs) for lbl, evs in label_to_events.items()
+        }
+        sorted_labels = sorted(lamp_counts.keys(), key=lambda l: lamp_counts[l])
+
+        # assemble up to 4 events, each from a different light if possible
+        events: List[Dict] = []
+        used_episodes = set()
+        for lbl in sorted_labels:
+            for ev in label_to_events[lbl]:
+                ep_id = ev.get("episode")
+                if ep_id in used_episodes:
+                    continue
+                events.append(ev)
+                used_episodes.add(ep_id)
+                break
+            if len(events) >= 4:
+                break
+
+        if not events:
+            events = random.sample(
+                self.interesting_events,
+                k=min(3, len(self.interesting_events)),
+            )
+
+        # 1) reset lights & capture baseline
         self._wait_lamps_reset()
         L_init = self._get_light_state()
 
-        # 2) 快速依次发送多个 ID 的 payload
+        # 2) quickly send all selected ID/payload pairs
         for ev in events:
             cid = ev["id"]
             payload = ev["payload"]
-            # 多 ID 组合时，为了不拉长时间，这里只发 1 帧
             self._send_frames(cid, payload, repeats=1, freq_hz=50.0)
             time.sleep(0.01)
 
-        # 3) 短暂等待，保证在 0.5s 内检测
+        # 3) detect within semantic window
         time.sleep(self.settle_time)
         L_end = self._get_light_state()
 
-        reward, changed_cnt, is_new, lamp_on, lamp_off = self._compute_reward(L_init, L_end)
+        reward, changed_cnt, is_new, lamp_on, lamp_off = self._compute_reward(
+            L_init, L_end
+        )
 
+        # optional: try to detect master-like warning light (label contains 'master')
         master_idx = self._find_master_warning_index()
         master_on = False
         if master_idx is not None and len(L_init) == len(L_end):
@@ -315,45 +328,52 @@ class SuperVisionGuidedAdaptiveFuzzer:
         self.multi_combo_events.append(rec)
 
         print(
-            f"[EP {ep:04d}] multi-ID combo, "
-            f"reward={reward:.2f}, Δlights={changed_cnt}, master_on={master_on}"
+            f"[EP {ep:04d}] multi-ID combo, reward={reward:.2f}, "
+            f"Δlights={changed_cnt}, master_on={master_on}"
         )
 
-    # ===================== ID 选择（bandit + 覆盖） =====================
+    # ===================== ID selection (bandit + coverage) =====================
 
     def _select_id(self) -> int:
-        """
-        两阶段：
-        1) 覆盖：保证所有 ID 至少试验 global_min_trials_per_id 次；
-        2) 在此基础上，对未达到 max_trials_per_id 的 ID 用 epsilon-greedy。
-        """
-        # 覆盖阶段
+        """Two-phase ID selection: coverage-first then epsilon-greedy bandit."""
+        # coverage phase: ensure each ID has at least global_min_trials_per_id
         min_N = min(stat["N"] for stat in self.id_stats.values())
         if min_N < self.global_min_trials_per_id:
-            candidates = [cid for cid, stat in self.id_stats.items() if stat["N"] == min_N]
+            candidates = [
+                cid for cid, stat in self.id_stats.items() if stat["N"] == min_N
+            ]
             return random.choice(candidates)
 
-        # epsilon-greedy 阶段，限制单 ID 最大次数
-        eligible_ids = [cid for cid, stat in self.id_stats.items() if stat["N"] < self.max_trials_per_id]
+        # epsilon-greedy phase
+        eligible_ids = [
+            cid
+            for cid, stat in self.id_stats.items()
+            if stat["N"] < self.max_trials_per_id
+        ]
         if not eligible_ids:
-            eligible_ids = list(self.id_stats.keys())
+            # everyone hit the soft limit; pick among least-used IDs
+            min_N_all = min(stat["N"] for stat in self.id_stats.values())
+            eligible_ids = [
+                cid for cid, stat in self.id_stats.items() if stat["N"] == min_N_all
+            ]
 
         if random.random() < self.epsilon:
-            # 探索：在 eligible 中选 N 最小的
+            # exploration: among eligible IDs, prefer least-tried ones
             min_N_elig = min(self.id_stats[cid]["N"] for cid in eligible_ids)
-            candidates = [cid for cid in eligible_ids if self.id_stats[cid]["N"] == min_N_elig]
+            candidates = [
+                cid for cid in eligible_ids if self.id_stats[cid]["N"] == min_N_elig
+            ]
         else:
-            # 利用：在 eligible 中选 R 最大的
+            # exploitation: among eligible IDs, prefer highest mean reward
             max_R = max(self.id_stats[cid]["R"] for cid in eligible_ids)
-            candidates = [cid for cid in eligible_ids if self.id_stats[cid]["R"] == max_R]
+            candidates = [
+                cid for cid in eligible_ids if self.id_stats[cid]["R"] == max_R
+            ]
 
         return random.choice(candidates)
 
     def _maybe_expand_neighbors(self, cid: int):
-        """
-        当某个 ID 的平均 reward 较高且尝试数达到一定阈值时，
-        将其邻接 ID（cid±neighbor_delta）加入候选集。
-        """
+        """Generic neighbor expansion based on per-ID reward."""
         if cid in self.neighbor_expanded_ids:
             return
 
@@ -363,7 +383,7 @@ class SuperVisionGuidedAdaptiveFuzzer:
         if stat["R"] < self.neighbor_reward_threshold:
             return
 
-        new_ids = []
+        new_ids: List[int] = []
         for d in (-self.neighbor_delta, self.neighbor_delta):
             nid = cid + d
             if nid < self.id_min or nid > self.id_max:
@@ -379,17 +399,16 @@ class SuperVisionGuidedAdaptiveFuzzer:
         for nid in new_ids:
             self.id_stats[nid] = {"R": 0.0, "N": 0.0}
             self.id_candidates.append(nid)
-            print(f"[AdaptiveFuzzer] Neighbor ID added: 0x{nid:03X}")
+            print(f"[SuperFuzzer] Neighbor ID added: 0x{nid:03X}")
 
         self.neighbor_expanded_ids.add(cid)
 
-    # ===================== CAN 发送 & 视觉采样 =====================
+    # ===================== CAN send & vision sampling =====================
 
-    def _send_frames(self, cid: int, payload: bytes, repeats: int = 1, freq_hz: Optional[float] = None):
-        """
-        在当前 ID 上重复发送若干帧 payload。
-        freq_hz 为 None 时使用 default_freq_hz。
-        """
+    def _send_frames(
+        self, cid: int, payload: bytes, repeats: int = 1, freq_hz: Optional[float] = None
+    ):
+        """Send a sequence of CAN frames on a given ID."""
         if freq_hz is None:
             freq_hz = self.default_freq_hz
 
@@ -405,20 +424,20 @@ class SuperVisionGuidedAdaptiveFuzzer:
         for _ in range(repeats):
             try:
                 bus.send(msg)
-            except can.CanError as e:
-                print(f"[AdaptiveFuzzer] CAN send failed: {e}")
+            except can.CanError as exc:  # pragma: no cover
+                print(f"[SuperFuzzer] CAN send failed: {exc}")
             time.sleep(interval)
 
     def _get_light_state(self) -> Tuple[int, ...]:
-        """
-        从视觉模块获取当前故障灯状态，映射为固定长度 0/1 向量。
-        """
+        """Query detector and convert detections to a fixed-length 0/1 vector."""
         detections = self.detector.detect()
         if not detections:
+            if not self.labels:
+                return tuple()
             return tuple([0] * self.K)
 
+        # first detection: bootstrap label list
         if not self.labels:
-            # 第一次检测时建立 labels 列表
             for det in detections:
                 lbl = det["label"]
                 if lbl not in self.labels:
@@ -427,11 +446,10 @@ class SuperVisionGuidedAdaptiveFuzzer:
 
         label_to_idx = {lbl: idx for idx, lbl in enumerate(self.labels)}
         state = [0] * self.K
-
         for det in detections:
             lbl = det["label"]
             if lbl not in label_to_idx:
-                # 出现新的 label，动态扩展
+                # new label discovered at runtime
                 self.labels.append(lbl)
                 label_to_idx[lbl] = len(self.labels) - 1
                 state.append(1)
@@ -442,31 +460,25 @@ class SuperVisionGuidedAdaptiveFuzzer:
         return tuple(state)
 
     def _find_master_warning_index(self) -> Optional[int]:
-        """
-        尝试在 labels 中找到 Master warning 灯的索引。
-        规则：label 中包含 'Master' 或 'master'。
-        """
+        """Try to locate a master-warning-like lamp by label substring."""
         for idx, lbl in enumerate(self.labels):
             if "master" in lbl.lower():
                 return idx
         return None
 
-    # ===================== reward & event 统计 =====================
+    # ===================== reward & event registration =====================
 
     def _compute_reward(
         self,
         L_before: Tuple[int, ...],
         L_after: Tuple[int, ...],
     ) -> Tuple[float, int, bool, List[int], List[int]]:
-        """
-        reward = alpha * (# 灯变化数) + beta * 1(出现新的灯态模式)
-        同时返回哪些灯 0→1 / 1→0。
-        """
+        """Compute reward based on light-state changes."""
         if len(L_before) != len(L_after):
             return 0.0, 0, False, [], []
 
-        lamp_on = []
-        lamp_off = []
+        lamp_on: List[int] = []
+        lamp_off: List[int] = []
         changed_cnt = 0
 
         for i, (b, a) in enumerate(zip(L_before, L_after)):
@@ -485,7 +497,7 @@ class SuperVisionGuidedAdaptiveFuzzer:
         return reward, changed_cnt, is_new, lamp_on, lamp_off
 
     def _update_bandit(self, cid: int, reward: float):
-        """增量更新该 ID 的平均 reward 和尝试次数。"""
+        """Incrementally update mean reward for the given ID."""
         stat = self.id_stats[cid]
         N_old = stat["N"]
         R_old = stat["R"]
@@ -496,25 +508,22 @@ class SuperVisionGuidedAdaptiveFuzzer:
 
     def _register_interesting_event(
         self,
+        ep: int,
         cid: int,
         payload: bytes,
         reward: float,
         lamp_on: List[int],
         lamp_off: List[int],
         min_reward: float = 1.0,
-        max_events_per_id: int = 20,
-    ):
-        """
-        记录“有趣事件”：只要 reward 足够且发生了灯变化，用于：
-        - multi-ID 组合实验
-        - 后续（如需要）引导型 payload 生成
-        """
+        max_events_per_id: int = 50,
+    ) -> None:
+        """Record high-reward events that changed at least one light."""
         if reward < min_reward or not lamp_on:
             return
 
         labels = [self.labels[i] for i in lamp_on] if self.labels else []
-
         ev = {
+            "episode": ep,
             "id": cid,
             "payload": payload,
             "lamp_on": lamp_on,
@@ -523,248 +532,281 @@ class SuperVisionGuidedAdaptiveFuzzer:
             "reward": reward,
         }
         self.interesting_events.append(ev)
-        if len(self.interesting_events) > 500:
-            self.interesting_events = self.interesting_events[-500:]
+        if len(self.interesting_events) > 2000:
+            self.interesting_events = self.interesting_events[-2000:]
 
-        # 针对该 ID 保存若干高价值 payload
+        # maintain a small buffer of best payloads per ID for guided mutation
         best_list = self.id_best_payloads[cid]
         if payload not in best_list:
             best_list.append(payload)
-            # 不做太复杂排序，长度控制一下即可
             if len(best_list) > max_events_per_id:
                 self.id_best_payloads[cid] = best_list[-max_events_per_id:]
         else:
             self.id_best_payloads[cid] = best_list
 
-    # ===================== payload 生成 =====================
+    # ===================== payload generation =====================
 
     def _random_payload(self) -> bytes:
-        """
-        结构化随机生成 payload：
-        - 50%：全随机 8 byte
-        - 50%：稀疏激活（只动 1-3 个 byte，用典型值）
-        同时插入一些“典型阈值附近的数值”，有利于触发 >=5555, <=32, <=96 等条件。
-        """
-        # 一些典型的 8-bit 和 16-bit 值
-        interesting_byte_values = [0x00, 0x01, 0x02, 0x10, 0x20, 0x32, 0x40, 0x55, 0x5A, 0x60, 0x80, 0x96, 0xFF]
-        interesting_word_values = [0x0000, 0x0101, 0x1010, 0x3232, 0x5555, 0x5A5A, 0x7FFF, 0xFFFF]
-
-        if random.random() < 0.5:
-            # 全随机
+        """Structured random payload generation."""
+        mode = random.random()
+        if mode < 0.5:
+            # fully random 8-byte payload
             return bytes(random.getrandbits(8) for _ in range(8))
-        else:
-            # 稀疏激活
-            data = [0x00] * 8
-            num_bytes = random.randint(1, 3)
-            positions = random.sample(range(8), num_bytes)
-            for pos in positions:
-                if random.random() < 0.7:
-                    data[pos] = random.choice(interesting_byte_values)
+
+        # sparse / structured payload
+        data = [0x00] * 8
+        num_bytes = random.randint(1, 3)
+        byte_positions = random.sample(range(8), num_bytes)
+
+        # include 0x01, 0x10, 0x20... to better excite individual bits/thresholds
+        interesting_byte_values = [
+            0x00,
+            0x01,
+            0x02,
+            0x04,
+            0x08,
+            0x10,
+            0x20,
+            0x32,
+            0x40,
+            0x55,
+            0x5A,
+            0x60,
+            0x80,
+            0x96,
+            0xFF,
+        ]
+        interesting_word_values = [
+            0x0000,
+            0x0101,
+            0x1010,
+            0x3232,
+            0x5555,
+            0x5A5A,
+            0x7FFF,
+            0xFFFF,
+        ]
+
+        for pos in byte_positions:
+            if random.random() < 0.7:
+                data[pos] = random.choice(interesting_byte_values)
+            else:
+                if pos <= 6:
+                    val = random.choice(interesting_word_values)
+                    data[pos] = val & 0xFF
+                    data[pos + 1] = (val >> 8) & 0xFF
                 else:
-                    # 以 16-bit 方式赋值（跨两个 byte）
-                    if pos <= 6:
-                        val = random.choice(interesting_word_values)
-                        data[pos] = (val & 0xFF)
-                        data[pos + 1] = ((val >> 8) & 0xFF)
-                    else:
-                        data[pos] = random.choice(interesting_byte_values)
-            return bytes(data)
+                    data[pos] = random.choice(interesting_byte_values)
+
+        return bytes(data)
 
     def _mutate_around(self, base: bytes) -> bytes:
-        """
-        在一个“已知有趣”的 payload 周围进行微调：
-        - 翻转一些 bit 或对若干 byte 做 +delta/-delta。
-        """
+        """Local mutation around a known interesting payload."""
         data = list(base)
-        # 随机选择 1~3 个字节进行变异
+        # mutate 1–3 bytes
         for _ in range(random.randint(1, 3)):
             idx = random.randrange(8)
             mode = random.random()
             if mode < 0.5:
-                # 翻转一个 bit
+                # flip a random bit
                 bit = 1 << random.randint(0, 7)
                 data[idx] ^= bit
             else:
-                # 小幅加减
-                delta = random.choice([-0x10, -0x08, -0x04, 0x04, 0x08, 0x10])
+                # small +/- delta on the whole byte
+                delta = random.randint(-8, 8)
                 data[idx] = (data[idx] + delta) & 0xFF
         return bytes(data)
 
     def _generate_mutated_payload(self, cid: int) -> bytes:
-        """
-        生成当前 ID 的 mutated payload：
-        - 50% 纯随机/结构化随机；
-        - 50% 在该 ID 已知高价值 payload 周围微调（如果有）。
-        """
-        use_guided = cid in self.id_best_payloads and self.id_best_payloads[cid] and random.random() < 0.5
+        """Generate a mutated payload for the given ID."""
+        use_guided = (
+            cid in self.id_best_payloads
+            and self.id_best_payloads[cid]
+            and random.random() < 0.5
+        )
         if use_guided:
             base = random.choice(self.id_best_payloads[cid])
             payload = self._mutate_around(base)
         else:
             payload = self._random_payload()
 
-        # 确保 mutated 与 baseline 不同
         if payload == self.baseline_payload:
             payload = self._random_payload()
 
         return payload
 
-    # ===================== bit→灯 映射构建（基于 baseline vs mutated） =====================
+    # ===================== bit→lamp mapping (offline inference) =====================
 
     def _build_bit_mapping_stats(self) -> List[Dict]:
-        """
-        对所有 single-type 试验，构建 bit→灯 映射统计：
-        对每个 (ID, byte, bit, lamp) 统计：
-        - 当 baseline→mutated 时该 bit 被改变的 episode 数；
-        - 在这些 episode 中 lamp 0→1 / 1→0 的次数。
-        """
-        bit_stats: Dict[Tuple[int, int, int, int], Dict[str, int]] = {}
-        bit_episode_counts: Dict[Tuple[int, int, int], int] = {}
-        bit_example_payload: Dict[Tuple[int, int, int], str] = {}
+        """Build bit→warning-light mapping candidates from trial_log."""
+        if not self.trial_log or not self.labels:
+            return []
+
+        # bit_stats[(id, byte_idx, bit_idx, lamp_idx)] = {...}
+        bit_stats: Dict[Tuple[int, int, int, int], Dict[str, object]] = {}
 
         for rec in self.trial_log:
             if rec.get("type") != "single":
                 continue
 
-            cid = rec["id"]
-            B_hex = rec.get("baseline_payload", "")
-            M_hex = rec.get("mut_payload", "")
-            if not B_hex or not M_hex:
+            cid = rec.get("id")
+            M_hex = rec.get("mut_payload")
+            if cid is None or not M_hex:
+                continue
+            try:
+                payload = bytes.fromhex(M_hex)
+            except ValueError:
+                continue
+            if len(payload) < 1:
                 continue
 
-            B = bytes.fromhex(B_hex)
-            M = bytes.fromhex(M_hex)
-            if len(B) != 8 or len(M) != 8:
+            L_after_str = rec.get("L_after", "")
+            if not L_after_str:
+                continue
+            L_after = [int(ch) for ch in L_after_str]
+            lamp_count = len(L_after)
+            if lamp_count == 0:
                 continue
 
-            Lb_str = rec.get("L_before", "")
-            La_str = rec.get("L_after", "")
-            if not Lb_str or not La_str:
-                continue
-            L_before = [int(ch) for ch in Lb_str]
-            L_after = [int(ch) for ch in La_str]
-            if len(L_before) != len(L_after):
-                continue
+            total_bits = len(payload) * 8
+            for bit_pos in range(total_bits):
+                byte_idx = bit_pos // 8
+                bit_idx = bit_pos % 8
+                bit_val = (payload[byte_idx] >> bit_idx) & 0x1
 
-            # 该 episode 中哪些 bit 从 baseline 改变了
-            mutated_bits: List[Tuple[int, int]] = []
-            for bit_idx in range(64):
-                byte_i = bit_idx // 8
-                bit_i = bit_idx % 8
-                b_bit = (B[byte_i] >> bit_i) & 0x1
-                m_bit = (M[byte_i] >> bit_i) & 0x1
-                if b_bit != m_bit:
-                    mutated_bits.append((byte_i, bit_i))
+                for lamp_idx in range(lamp_count):
+                    lamp_state = L_after[lamp_idx]
+                    key = (cid, byte_idx, bit_idx, lamp_idx)
+                    stats = bit_stats.get(
+                        key,
+                        {
+                            "bit1_on": 0,
+                            "bit1_total": 0,
+                            "bit0_on": 0,
+                            "bit0_total": 0,
+                            "example1": None,
+                            "example0": None,
+                        },
+                    )
 
-            if not mutated_bits:
-                continue
+                    if bit_val == 1:
+                        stats["bit1_total"] = int(stats["bit1_total"]) + 1
+                        if lamp_state == 1:
+                            stats["bit1_on"] = int(stats["bit1_on"]) + 1
+                            if stats["example1"] is None:
+                                stats["example1"] = M_hex
+                    else:
+                        stats["bit0_total"] = int(stats["bit0_total"]) + 1
+                        if lamp_state == 1:
+                            stats["bit0_on"] = int(stats["bit0_on"]) + 1
+                            if stats["example0"] is None:
+                                stats["example0"] = M_hex
 
-            # 记录 bit 被测试的次数 & 示例 payload
-            for (byte_i, bit_i) in mutated_bits:
-                key_bit = (cid, byte_i, bit_i)
-                bit_episode_counts[key_bit] = bit_episode_counts.get(key_bit, 0) + 1
-                if key_bit not in bit_example_payload:
-                    bit_example_payload[key_bit] = M_hex
+                    bit_stats[key] = stats
 
-            # 根据灯的变化，把事件分派给所有 mutated bits
-            for lamp_idx, (b, a) in enumerate(zip(L_before, L_after)):
-                if b == a:
-                    continue
-                for (byte_i, bit_i) in mutated_bits:
-                    key = (cid, byte_i, bit_i, lamp_idx)
-                    st = bit_stats.get(key, {"on": 0, "off": 0})
-                    if b == 0 and a == 1:
-                        st["on"] += 1
-                    elif b == 1 and a == 0:
-                        st["off"] += 1
-                    bit_stats[key] = st
-
-        # 从统计中提取候选映射
         mappings: List[Dict] = []
-        for (cid, byte_i, bit_i), ep_cnt in bit_episode_counts.items():
-            if ep_cnt < self.min_bit_events_for_mapping:
+        for (cid, byte_idx, bit_idx, lamp_idx), st in bit_stats.items():
+            bit1_on = int(st["bit1_on"])
+            bit1_total = int(st["bit1_total"])
+            bit0_on = int(st["bit0_on"])
+            bit0_total = int(st["bit0_total"])
+
+            total_samples = bit1_total + bit0_total
+            lamp_on_total = bit1_on + bit0_on
+
+            if lamp_on_total < self.min_bit_events_for_mapping:
+                continue
+            if bit1_total == 0 or bit0_total == 0:
                 continue
 
-            best_lamp = None
-            best_on = 0
-            best_off = 0
-            best_total = 0
+            # rule 1: active_high (bit=1 -> lamp=1)
+            TP = bit1_on
+            FP = bit1_total - bit1_on
+            FN = bit0_on
+            denom_high = 2 * TP + FP + FN
+            F1_high = 0.0 if denom_high == 0 else (2.0 * TP) / denom_high
 
-            for lamp_idx in range(self.K):
-                st = bit_stats.get((cid, byte_i, bit_i, lamp_idx))
-                if not st:
-                    continue
-                on = st["on"]
-                off = st["off"]
-                tot = on + off
-                if tot > best_total:
-                    best_total = tot
-                    best_lamp = lamp_idx
-                    best_on = on
-                    best_off = off
+            # rule 2: active_low (bit=0 -> lamp=1)
+            TP_low = bit0_on
+            FP_low = bit0_total - bit0_on
+            FN_low = bit1_on
+            denom_low = 2 * TP_low + FP_low + FN_low
+            F1_low = 0.0 if denom_low == 0 else (2.0 * TP_low) / denom_low
 
-            if best_lamp is None or best_total == 0:
+            if F1_high <= 0.0 and F1_low <= 0.0:
                 continue
 
-            # 极性 & 置信度
-            if best_on > 2 * best_off:
+            if F1_high >= F1_low:
                 polarity = "active_high"
-                main_count = best_on
-            elif best_off > 2 * best_on:
-                polarity = "active_low"
-                main_count = best_off
+                confidence = F1_high
+                example_payload = st["example1"]
             else:
-                polarity = "uncertain"
-                main_count = max(best_on, best_off)
+                polarity = "active_low"
+                confidence = F1_low
+                example_payload = st["example0"]
 
-            confidence = main_count / float(ep_cnt)
             if confidence < self.min_confidence_for_mapping:
                 continue
 
-            label = self.labels[best_lamp] if 0 <= best_lamp < len(self.labels) else str(best_lamp)
-            mappings.append({
-                "id": cid,
-                "id_hex": f"0x{cid:03X}",
-                "byte_index": byte_i,
-                "bit_index": bit_i,
-                "lamp_index": best_lamp,
-                "label": label,
-                "polarity": polarity,
-                "confidence": confidence,
-                "on_count": best_on,
-                "off_count": best_off,
-                "episodes": ep_cnt,
-                "example_payload": bit_example_payload.get((cid, byte_i, bit_i), ""),
-            })
+            label = (
+                self.labels[lamp_idx]
+                if 0 <= lamp_idx < len(self.labels)
+                else f"lamp_{lamp_idx}"
+            )
 
-        mappings_sorted = sorted(mappings, key=lambda m: (m["id"], m["byte_index"], m["bit_index"]))
+            mappings.append(
+                {
+                    "id": cid,
+                    "id_hex": f"0x{cid:03X}",
+                    "byte_index": byte_idx,
+                    "bit_index": bit_idx,
+                    "lamp_index": lamp_idx,
+                    "label": label,
+                    "polarity": polarity,
+                    "confidence": float(confidence),
+                    "bit1_on": bit1_on,
+                    "bit1_total": bit1_total,
+                    "bit0_on": bit0_on,
+                    "bit0_total": bit0_total,
+                    "lamp_on_total": lamp_on_total,
+                    "sample_total": total_samples,
+                    "example_payload": example_payload or "",
+                }
+            )
+
+        mappings_sorted = sorted(
+            mappings,
+            key=lambda m: (m["id"], m["byte_index"], m["bit_index"], m["lamp_index"]),
+        )
         return mappings_sorted
 
-    # ===================== 报告生成 =====================
+    # ===================== summary & reporting =====================
 
     def _build_summary_dict(self) -> Dict:
         total_trials = len(self.trial_log)
         total_patterns = len(self.coverage)
 
-        # 每个 ID 的整体统计
         id_summary = []
         for cid, stat in self.id_stats.items():
             if stat["N"] <= 0:
                 continue
             patterns = self.id_patterns.get(cid, set())
-            id_summary.append({
-                "id": cid,
-                "id_hex": f"0x{cid:03X}",
-                "trials": int(stat["N"]),
-                "mean_reward": float(stat["R"]),
-                "pattern_count": len(patterns),
-            })
-        id_summary_sorted = sorted(id_summary, key=lambda x: x["mean_reward"], reverse=True)
+            id_summary.append(
+                {
+                    "id": cid,
+                    "id_hex": f"0x{cid:03X}",
+                    "trials": int(stat["N"]),
+                    "mean_reward": float(stat["R"]),
+                    "pattern_count": len(patterns),
+                }
+            )
 
-        # bit 映射候选
+        id_summary_sorted = sorted(
+            id_summary, key=lambda x: x["mean_reward"], reverse=True
+        )
+
         bit_mappings = self._build_bit_mapping_stats()
 
-        # multi-ID 组合中 master warning 出现次数
         master_idx = self._find_master_warning_index()
         master_combo_hits = 0
         for rec in self.multi_combo_events:
@@ -781,21 +823,24 @@ class SuperVisionGuidedAdaptiveFuzzer:
             "bit_mappings": bit_mappings,
             "multi_combo_count": len(self.multi_combo_events),
             "multi_combo_master_hits": master_combo_hits,
+            "master_index": master_idx,
         }
         return summary
 
-    def _write_text_report(self, summary: Dict, path: str):
+    def _write_text_report(self, summary: Dict, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
-            f.write("Vision-Guided Adaptive CAN Fuzzing Report\n")
+            f.write("Vision-Guided Adaptive CAN Fuzzing Report (Super Version)\n")
             f.write(f"Run ID: {summary['run_id']}\n")
             f.write(
                 f"Global ID range: 0x{summary['global_id_range'][0]:03X} "
                 f"- 0x{summary['global_id_range'][1]:03X}\n"
             )
             f.write(f"Total trials: {summary['total_trials']}\n")
-            f.write(f"Total unique light patterns: {summary['unique_patterns']}\n\n")
+            f.write(
+                f"Total unique light patterns: {summary['unique_patterns']}\n\n"
+            )
 
-            f.write("Warning-light index mapping:\n")
+            f.write("Warning-light index mapping (YOLO labels):\n")
             for idx, lbl in summary["label_mapping"].items():
                 f.write(f"  [{idx}] {lbl}\n")
             f.write("\n")
@@ -803,8 +848,7 @@ class SuperVisionGuidedAdaptiveFuzzer:
             f.write("Per-ID statistics (sorted by mean_reward):\n")
             for entry in summary["id_summary"]:
                 f.write(
-                    f"- ID {entry['id_hex']}: "
-                    f"trials={entry['trials']}, "
+                    f"- ID {entry['id_hex']}: trials={entry['trials']}, "
                     f"mean_reward={entry['mean_reward']:.2f}, "
                     f"pattern_count={entry['pattern_count']}\n"
                 )
@@ -812,124 +856,159 @@ class SuperVisionGuidedAdaptiveFuzzer:
 
             f.write(
                 f"Multi-ID combo trials: {summary['multi_combo_count']}, "
-                f"master warning hits: {summary['multi_combo_master_hits']}\n\n"
+                f"master-like warning hits: {summary['multi_combo_master_hits']}\n\n"
             )
 
-            f.write("Candidate bit-to-warning-light mappings:\n\n")
+            f.write("Candidate bit-to-warning-light mappings (thresholded):\n\n")
             if not summary["bit_mappings"]:
                 f.write("  (no candidates above thresholds)\n")
             else:
                 for m in summary["bit_mappings"]:
                     f.write(
-                        f"- ID {m['id_hex']} Byte {m['byte_index']} Bit {m['bit_index']} "
-                        f"-> {m['label']} ({m['polarity']}, "
-                        f"conf={m['confidence']:.2f}, "
-                        f"on={m['on_count']}, off={m['off_count']}, "
-                        f"episodes={m['episodes']}, "
+                        f"- {m['label']} :: ID {m['id_hex']} "
+                        f"Byte {m['byte_index']} Bit {m['bit_index']} "
+                        f"({m['polarity']}, conf={m['confidence']:.2f}, "
+                        f"lamp_on={m['lamp_on_total']}, "
+                        f"samples={m['sample_total']}, "
                         f"example_payload={m['example_payload']})\n"
                     )
 
-    def _write_pdf_dbc_table(self, summary: Dict, path: str):
-        """
-        用 ReportLab 输出 PDF，包含两张表：
-        1) 每个 ID 的统计；
-        2) bit-level 候选 DBC 表。
-        """
+    def _write_pdf_dbc_table(self, summary: Dict, path: str) -> None:
+        """Write ID-level summary and bit→lamp candidate table into a PDF."""
         bit_mappings = summary.get("bit_mappings", [])
         id_summary = summary.get("id_summary", [])
-        if not bit_mappings:
-            print("[AdaptiveFuzzer] No bit mappings to export to PDF.")
+        if not bit_mappings and not id_summary:
+            print("[SuperFuzzer] No data to export to PDF.")
             return
 
         try:
             from reportlab.lib.pagesizes import A4, landscape
             from reportlab.lib import colors
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.platypus import (
+                SimpleDocTemplate,
+                Table,
+                TableStyle,
+                Paragraph,
+                Spacer,
+            )
             from reportlab.lib.styles import getSampleStyleSheet
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] ReportLab not available, skip PDF export: {e}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[SuperFuzzer] ReportLab not available, skip PDF export: {exc}")
             return
 
         doc = SimpleDocTemplate(path, pagesize=landscape(A4))
         styles = getSampleStyleSheet()
         story = []
 
-        title = Paragraph("Vision-Guided Candidate DBC Table", styles["Title"])
+        title = Paragraph(
+            "Vision-Guided Candidate DBC Table (Bit-to-Warning-Light Mapping)",
+            styles["Title"],
+        )
         info = Paragraph(f"Run ID: {summary['run_id']}", styles["Normal"])
         story.append(title)
         story.append(Spacer(1, 6))
         story.append(info)
         story.append(Spacer(1, 12))
 
-        # 表 1：每个 ID 的统计
+        # Table 1: per-ID summary
         if id_summary:
             data1 = [["ID (hex)", "Trials", "Mean reward", "#Patterns"]]
             for entry in id_summary:
-                data1.append([
-                    entry["id_hex"],
-                    entry["trials"],
-                    f"{entry['mean_reward']:.2f}",
-                    entry["pattern_count"],
-                ])
+                data1.append(
+                    [
+                        entry["id_hex"],
+                        entry["trials"],
+                        f"{entry['mean_reward']:.2f}",
+                        entry["pattern_count"],
+                    ]
+                )
             table1 = Table(data1, repeatRows=1)
-            style1 = TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 9),
-                ("FONTSIZE", (0, 1), (-1, -1), 8),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ])
+            style1 = TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("FONTSIZE", (0, 1), (-1, -1), 8),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
             table1.setStyle(style1)
             story.append(table1)
             story.append(Spacer(1, 12))
 
-        # 表 2：bit-level 候选 DBC 表
-        data2 = [["ID (hex)", "Byte", "Bit", "Signal label", "Polarity",
-                  "Confidence", "#On", "#Off", "#Episodes", "Example payload"]]
-        for m in bit_mappings:
-            data2.append([
-                m["id_hex"],
-                m["byte_index"],
-                m["bit_index"],
-                m["label"],
-                m["polarity"],
-                f"{m['confidence']:.2f}",
-                m["on_count"],
-                m["off_count"],
-                m["episodes"],
-                m["example_payload"],
-            ])
+        # Table 2: bit→lamp candidate DBC (grouped by warning light)
+        if bit_mappings:
+            sorted_bits = sorted(
+                bit_mappings,
+                key=lambda m: (
+                    m["label"],
+                    m["id_hex"],
+                    m["byte_index"],
+                    m["bit_index"],
+                ),
+            )
 
-        table2 = Table(data2, repeatRows=1)
-        style2 = TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ])
-        table2.setStyle(style2)
-        story.append(table2)
+            data2 = [
+                [
+                    "Warning light",
+                    "ID (hex)",
+                    "Byte",
+                    "Bit",
+                    "Polarity",
+                    "Confidence",
+                    "#LampOn",
+                    "#Bit=1 & LampOn",
+                    "#Bit=1 total",
+                    "#Bit=0 & LampOn",
+                    "#Bit=0 total",
+                    "Example payload",
+                ]
+            ]
+
+            for m in sorted_bits:
+                data2.append(
+                    [
+                        m["label"],
+                        m["id_hex"],
+                        m["byte_index"],
+                        m["bit_index"],
+                        m["polarity"],
+                        f"{m['confidence']:.2f}",
+                        m["lamp_on_total"],
+                        m["bit1_on"],
+                        m["bit1_total"],
+                        m["bit0_on"],
+                        m["bit0_total"],
+                        m["example_payload"],
+                    ]
+                )
+
+            table2 = Table(data2, repeatRows=1)
+            style2 = TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("FONTSIZE", (0, 1), (-1, -1), 7),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
+            table2.setStyle(style2)
+            story.append(table2)
 
         doc.build(story)
-        print(f"[AdaptiveFuzzer] DBC candidate PDF written to {path}")
+        print(f"[SuperFuzzer] DBC candidate PDF written to {path}")
 
-    def _save_logs_and_report(self):
-        """
-        保存：
-        - trial 级别日志 CSV；
-        - summary.json；
-        - summary.txt；
-        - DBC 候选 PDF。
-        """
+    def _save_logs_and_report(self) -> None:
+        """Dump per-trial CSV, JSON summary, text report, and PDF DBC table."""
         if not self.trial_log:
-            print("[AdaptiveFuzzer] No trials recorded, skip logging.")
+            print("[SuperFuzzer] No trials recorded, skip logging.")
             return
 
         base = f"adaptive_fuzz_{self.run_id}"
@@ -938,7 +1017,7 @@ class SuperVisionGuidedAdaptiveFuzzer:
         txt_path = os.path.join(self.log_dir, base + "_summary.txt")
         pdf_path = os.path.join(self.log_dir, base + "_dbc_candidates.pdf")
 
-        # CSV
+        # CSV trial log
         fieldnames = sorted({k for rec in self.trial_log for k in rec.keys()})
         try:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -946,30 +1025,29 @@ class SuperVisionGuidedAdaptiveFuzzer:
                 writer.writeheader()
                 for rec in self.trial_log:
                     writer.writerow(rec)
-            print(f"[AdaptiveFuzzer] Trial log written to {csv_path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write CSV log: {e}")
+            print(f"[SuperFuzzer] Trial log written to {csv_path}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[SuperFuzzer] Failed to write CSV log: {exc}")
 
-        # summary
         summary = self._build_summary_dict()
 
-        # JSON
+        # JSON summary
         try:
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
-            print(f"[AdaptiveFuzzer] Summary JSON written to {json_path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write JSON summary: {e}")
+            print(f"[SuperFuzzer] Summary JSON written to {json_path}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[SuperFuzzer] Failed to write JSON summary: {exc}")
 
-        # TXT
+        # text report
         try:
             self._write_text_report(summary, txt_path)
-            print(f"[AdaptiveFuzzer] Summary text report written to {txt_path}")
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write text summary: {e}")
+            print(f"[SuperFuzzer] Summary text report written to {txt_path}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[SuperFuzzer] Failed to write text summary: {exc}")
 
-        # PDF
+        # PDF report
         try:
             self._write_pdf_dbc_table(summary, pdf_path)
-        except Exception as e:
-            print(f"[AdaptiveFuzzer] Failed to write PDF DBC table: {e}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[SuperFuzzer] Failed to write PDF DBC table: {exc}")
