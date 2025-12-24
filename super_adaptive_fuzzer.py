@@ -39,10 +39,11 @@ class SuperVisionGuidedAdaptiveFuzzer:
         alpha: float = 1.0,
         beta: float = 5.0,
         # CAN 发送与时序
-        default_freq_hz: float = 10.0,
-        baseline_repeats: int = 1,
+        default_freq_hz: float = 20.0,   # 建议稍微提一点频率
+        baseline_repeats: int = 0,       # 后面会不再使用 baseline 帧
         mutated_repeats: int = 3,
-        settle_time: float = 0.2,
+        settle_time: float = 0.05,       # 现在当作 detection_delay 使用
+        lamp_reset_time: float = 0.6,    # 新增：灯自动熄灭时间 + 安全裕量
         # ID 覆盖约束
         global_min_trials_per_id: int = 5,
         max_trials_per_id: int = 500,
@@ -63,6 +64,9 @@ class SuperVisionGuidedAdaptiveFuzzer:
     ):
         self.can_fuzzer = can_fuzzer
         self.detector = detector
+
+        self.settle_time = float(settle_time)  # 现在把它当作 detection_delay
+        self.lamp_reset_time = float(lamp_reset_time) # 两组报文之间的最小等待
 
         # ID 范围 & 初始候选集
         self.id_min = int(id_start)
@@ -144,6 +148,15 @@ class SuperVisionGuidedAdaptiveFuzzer:
         """允许外部提前终止 run 循环。"""
         self._stop_flag = True
 
+    def _wait_lamps_reset(self):
+        """
+        等待仪表盘上的灯自然熄灭。
+        固定 sleep lamp_reset_time。
+        也可以改成“循环检测直到所有灯都为 0 或超时”。
+        """
+        time.sleep(self.lamp_reset_time)
+
+
     def run(self, num_episodes: int = 5000):
         """
         主循环：执行 num_episodes 个“试验 episode”。
@@ -200,36 +213,36 @@ class SuperVisionGuidedAdaptiveFuzzer:
     def _run_single_id_trial(self, ep: int):
         cid = self._select_id()
 
-        # 1) baseline：全 0 payload
-        B = self.baseline_payload
-        self._send_frames(cid, B, repeats=self.baseline_repeats)
-        time.sleep(self.settle_time)
-        L0 = self._get_light_state()
+        # 1) 等待灯灭 + baseline 视觉
+        self._wait_lamps_reset()
+        L0 = self._get_light_state()  # 此时应该是全 0 或稳定状态
 
-        # 2) mutated：结构化随机 payload
+        # 2) mutated 报文：直接向该 ID 注入 payload
         M = self._generate_mutated_payload(cid)
         self._send_frames(cid, M, repeats=self.mutated_repeats)
+
+        # 短暂等待，让仪表有时间刷新，但保证在 0.5s 内
         time.sleep(self.settle_time)
         L1 = self._get_light_state()
 
-        # 3) reward & 灯变化统计
+        # 3) reward & 灯变化
         reward, changed_cnt, is_new, lamp_on, lamp_off = self._compute_reward(L0, L1)
 
-        # 4) 更新 bandit
+        # 4) 更新 bandit 和邻域
         self._update_bandit(cid, reward)
         self.id_patterns[cid].add(L1)
         self._maybe_expand_neighbors(cid)
 
-        # 5) 如果灯有变化且 reward 足够，记录为“有趣事件”，用于后续组合 & 引导
+        # 5) 记录有趣事件（用于 bit 映射与 multi-ID 组合）
         self._register_interesting_event(cid, M, reward, lamp_on, lamp_off)
 
-        # 6) 记录日志
+        # 6) 日志记录
         rec = {
             "episode": ep,
             "type": "single",
             "id": cid,
             "id_hex": f"0x{cid:03X}",
-            "baseline_payload": B.hex(),
+            "baseline_payload": self.baseline_payload.hex(),  # 概念上的全 0 baseline
             "mut_payload": M.hex(),
             "reward": float(reward),
             "changed_cnt": int(changed_cnt),
@@ -241,7 +254,6 @@ class SuperVisionGuidedAdaptiveFuzzer:
         }
         self.trial_log.append(rec)
 
-        # 控制台打印
         print(
             f"[EP {ep:04d}] single ID=0x{cid:03X}, "
             f"mut={M.hex()}, Δlights={changed_cnt}, new={is_new}, "
@@ -251,34 +263,32 @@ class SuperVisionGuidedAdaptiveFuzzer:
     # ===================== 多 ID 组合试验（Master Warning 等） =====================
 
     def _run_multi_id_combo_trial(self, ep: int):
-        """
-        组合多个已发现“有灯变化”的事件，尝试触发 Master Warning 等多 ID 灯。
-        不参与 bandit 更新，只用于探索高阶语义。
-        """
-        # 选取若干最近的有趣事件
         if len(self.interesting_events) < self.min_events_for_combo:
             return
 
-        events = random.sample(self.interesting_events, k=min(3, len(self.interesting_events)))
+        events = random.sample(
+            self.interesting_events,
+            k=min(3, len(self.interesting_events))
+        )
 
-        # 记录初始灯态
-        time.sleep(self.settle_time)
+        # 1) 确保起点灯状态干净
+        self._wait_lamps_reset()
         L_init = self._get_light_state()
 
-        # 依次发送各事件的 payload
+        # 2) 快速依次发送多个 ID 的 payload
         for ev in events:
             cid = ev["id"]
             payload = ev["payload"]
-            self._send_frames(cid, payload, repeats=self.mutated_repeats)
-            time.sleep(0.2)  # ID 之间的小间隔
+            # 多 ID 组合时，为了不拉长时间，这里只发 1 帧
+            self._send_frames(cid, payload, repeats=1, freq_hz=50.0)
+            time.sleep(0.01)
 
+        # 3) 短暂等待，保证在 0.5s 内检测
         time.sleep(self.settle_time)
         L_end = self._get_light_state()
 
-        # 判断整体灯变化
         reward, changed_cnt, is_new, lamp_on, lamp_off = self._compute_reward(L_init, L_end)
 
-        # 专门统计 master warning 是否被点亮
         master_idx = self._find_master_warning_index()
         master_on = False
         if master_idx is not None and len(L_init) == len(L_end):
@@ -375,11 +385,15 @@ class SuperVisionGuidedAdaptiveFuzzer:
 
     # ===================== CAN 发送 & 视觉采样 =====================
 
-    def _send_frames(self, cid: int, payload: bytes, repeats: int = 1):
+    def _send_frames(self, cid: int, payload: bytes, repeats: int = 1, freq_hz: Optional[float] = None):
         """
         在当前 ID 上重复发送若干帧 payload。
+        freq_hz 为 None 时使用 default_freq_hz。
         """
-        interval = 1.0 / self.default_freq_hz
+        if freq_hz is None:
+            freq_hz = self.default_freq_hz
+
+        interval = 1.0 / float(freq_hz)
         bus: can.Bus = self.can_fuzzer.bus
 
         msg = can.Message(

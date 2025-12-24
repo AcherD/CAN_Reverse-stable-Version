@@ -259,7 +259,7 @@ def super_adaptive_main():
         f"[AdaptiveMain] CANFuzzer on {can_channel}/{can_bustype}, "
         f"ID range=0x{int(can_id_start):X}-0x{int(can_id_end):X}"
     )
-    fuzzer = VisionGuidedAdaptiveFuzzer(
+    fuzzer = SuperVisionGuidedAdaptiveFuzzer(
         can_fuzzer=can_fuzzer,
         detector=detector,
         id_start=0x100,
@@ -268,10 +268,11 @@ def super_adaptive_main():
         epsilon=0.2,
         alpha=1.0,
         beta=5.0,
-        default_freq_hz=10.0,
+        default_freq_hz=20.0,
         baseline_repeats=1,
         mutated_repeats=3,  # 有利于触发类似 “2000ms 内 3 条报文” 条件
-        settle_time=0.2,
+        settle_time=0.1,
+        lamp_reset_time=0.6,
         global_min_trials_per_id=5,
         max_trials_per_id=500,
         neighbor_delta=1,
