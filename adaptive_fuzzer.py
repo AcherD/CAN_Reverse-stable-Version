@@ -47,27 +47,27 @@ class VisionGuidedAdaptiveFuzzer:
         seed_ids: Optional[List[int]] = None,
         epsilon: float = 0.2,
         alpha: float = 1.0,
-        beta: float = 5.0,
+        beta: float = 1.0,
         default_freq_hz: float = 10.0,
         frames_per_episode: int = 20,
-        settle_time: float = 0.2,
+        settle_time: float = 0.1,
         # bit-scan 触发阈值
         min_byte_trials_for_bit: int = 2,
         byte_reward_threshold_for_bit: float = 1.0,
         # 邻域扩展相关参数
         neighbor_delta: int = 0x1,
         neighbor_reward_threshold: float = 2.0,
-        neighbor_min_trials: int = 5,
+        neighbor_min_trials: int = 10,
         # ID selection fairness ID公平筛选
-        global_min_trials_per_id: int = 3,
-        max_trials_per_id: int = 200,
+        global_min_trials_per_id: int = 8,
+        max_trials_per_id: int = 40,
         # vision warmup
         vision_warmup_time: float = 2.0,
         # 日志与报告
         log_dir: str = "logs",
         # bit→灯映射统计阈值
-        min_bit_events_for_mapping: int = 3,
-        min_confidence_for_mapping: float = 0.6,
+        min_bit_events_for_mapping: int = 1,
+        min_confidence_for_mapping: float = 0.4,
     ):
         """
         :param can_fuzzer: 已初始化的 CANFuzzer，用于访问 bus 和 ID 范围

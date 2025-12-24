@@ -183,8 +183,8 @@ def adaptive_main():
     detector = VisionDetector(**vision_cfg)
     can_channel = can_cfg.get('channel', 'can0')
     can_bustype = can_cfg.get('bustype', 'socketcan')
-    can_id_start = can_cfg.get('id_start', 0x100)
-    can_id_end = can_cfg.get('id_end', 0x1FF)
+    can_id_start = can_cfg.get('id_start', 0x180)
+    can_id_end = can_cfg.get('id_end', 0x189)
     can_send_delay = can_cfg.get('send_delay', 0.01)
 
     can_fuzzer = CANFuzzer(
@@ -209,25 +209,25 @@ def adaptive_main():
         # 如果有 sniff 得到的 seed IDs，可以传进来，
         # 没有的话可以不填，使用 [id_start, id_end] 全范围
         # seed_ids=[0x180, 0x181, 0x182],
-        epsilon=0.2,
+        epsilon=0.4,
         alpha=1.0,
-        beta=5.0,
+        beta=1.0,
         default_freq_hz=10.0,
         frames_per_episode=20,
-        settle_time=0.6, #发送完一组报文之后的等待时间，应该大于灯熄灭时间
+        settle_time=0.1, #发送完一组报文之后的等待时间，应该大于灯熄灭时间
         min_byte_trials_for_bit=2,
         byte_reward_threshold_for_bit=1.0,
         neighbor_delta=0x1,
         neighbor_reward_threshold=2.0,
-        neighbor_min_trials=5,
-        log_dir="logs",
-        min_bit_events_for_mapping=3,
-        min_confidence_for_mapping=0.6,
+        neighbor_min_trials=10,
+        log_dir="logs1",
+        min_bit_events_for_mapping=1,
+        min_confidence_for_mapping=0.4,
     )
 
     # 4. 运行若干 episode（例如 500 个）
     try:
-        adaptive.run(num_episodes=500)
+        adaptive.run(num_episodes=5000)
     finally:
         detector.release()
         can_fuzzer.bus.shutdown()
