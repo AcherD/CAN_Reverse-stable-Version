@@ -9,6 +9,7 @@ from pathlib import Path
 from queue import Queue
 import os
 from adaptive_fuzzer import VisionGuidedAdaptiveFuzzer
+from super_adaptive_fuzzer import SuperVisionGuidedAdaptiveFuzzer
 
 def load_yaml(yaml_path: str) -> dict:
     """
@@ -232,11 +233,64 @@ def adaptive_main():
         detector.release()
         can_fuzzer.bus.shutdown()
 
+def super_adaptive_main():
+    # 1. 读配置
+    config = load_yaml("config.yaml")
+    vision_cfg = config.get("vision", {})
+    can_cfg = config.get("can", {})
+
+    # 2. 初始化 VisionDetector 和 CANFuzzer
+    detector = VisionDetector(**vision_cfg)
+    can_channel = can_cfg.get('channel', 'can0')
+    can_bustype = can_cfg.get('bustype', 'socketcan')
+    can_id_start = can_cfg.get('id_start', 0x180)
+    can_id_end = can_cfg.get('id_end', 0x189)
+    can_send_delay = can_cfg.get('send_delay', 0.01)
+
+    can_fuzzer = CANFuzzer(
+        channel=can_channel,
+        bustype=can_bustype,
+        id_start=can_id_start,
+        id_end=can_id_end,
+        send_delay=can_send_delay
+    )
+
+    print(
+        f"[AdaptiveMain] CANFuzzer on {can_channel}/{can_bustype}, "
+        f"ID range=0x{int(can_id_start):X}-0x{int(can_id_end):X}"
+    )
+    fuzzer = VisionGuidedAdaptiveFuzzer(
+        can_fuzzer=can_fuzzer,
+        detector=detector,
+        id_start=0x100,
+        id_end=0x1FF,
+        seed_ids=[0x180, 0x181, 0x182, 0x183, 0x184, 0x185, 0x186],  # 可选
+        epsilon=0.2,
+        alpha=1.0,
+        beta=5.0,
+        default_freq_hz=10.0,
+        baseline_repeats=1,
+        mutated_repeats=3,  # 有利于触发类似 “2000ms 内 3 条报文” 条件
+        settle_time=0.2,
+        global_min_trials_per_id=5,
+        max_trials_per_id=500,
+        neighbor_delta=1,
+        neighbor_min_trials=10,
+        neighbor_reward_threshold=1.0,
+        multi_combo_period=50,  # 每 50 个 episode 做一次多 ID 组合尝试
+        min_events_for_combo=3,
+        log_dir="logsSuper",
+        min_bit_events_for_mapping=5,
+        min_confidence_for_mapping=0.6,
+    )
+
+    fuzzer.run(num_episodes=5000)
 
 
 
 if __name__ == "__main__":
+    super_adaptive_main()
 # 调试阶段先调用 adaptive_main()
-    adaptive_main()
+#     adaptive_main()
     # 或根据需要保留原 main()
     # main()
