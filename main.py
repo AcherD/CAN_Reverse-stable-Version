@@ -262,30 +262,29 @@ def super_adaptive_main():
     fuzzer = SuperVisionGuidedAdaptiveFuzzer(
         can_fuzzer=can_fuzzer,
         detector=detector,
-        id_start=0x100,
-        id_end=0x1FF,
-        seed_ids=[0x180, 0x181, 0x182, 0x183, 0x184, 0x185, 0x186],  # 可选
-        epsilon=0.2,
+        id_start=0x180,
+        id_end=0x189,
+        epsilon=0.3,
         alpha=1.0,
-        beta=5.0,
+        beta=1.0,
         default_freq_hz=20.0,
         baseline_repeats=1,
-        mutated_repeats=3,  # 有利于触发类似 “2000ms 内 3 条报文” 条件
-        settle_time=0.1,
+        mutated_repeats=5,  # 有利于触发类似 “2000ms 内 3 条报文” 条件
+        settle_time=0.2,
         lamp_reset_time=0.6,
-        global_min_trials_per_id=5,
+        global_min_trials_per_id=20,
         max_trials_per_id=500,
         neighbor_delta=1,
         neighbor_min_trials=10,
         neighbor_reward_threshold=1.0,
-        multi_combo_period=50,  # 每 50 个 episode 做一次多 ID 组合尝试
+        multi_combo_period=30,  # 每 50 个 episode 做一次多 ID 组合尝试
         min_events_for_combo=3,
-        log_dir="logsSuper",
+        log_dir="logsSuper1225/exp4",
         min_bit_events_for_mapping=5,
         min_confidence_for_mapping=0.6,
     )
 
-    fuzzer.run(num_episodes=5000)
+    fuzzer.run(num_episodes=10000)
 
 
 
