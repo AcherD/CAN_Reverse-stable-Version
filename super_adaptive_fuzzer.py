@@ -1203,96 +1203,466 @@ class SuperVisionGuidedAdaptiveFuzzer:
                         f"example_payload={m['example_payload']})\n"
                     )
 
-    def _write_pdf_dbc_table(self, summary: Dict, path: str):
-        """
-        用 ReportLab 输出 PDF，包含两张表：
-        1) 每个 ID 的统计；
-        2) bit-level 候选 DBC 表。
-        """
-        bit_mappings = summary.get("bit_mappings", [])
-        id_summary = summary.get("id_summary", [])
-        if not bit_mappings:
-            print("[AdaptiveFuzzer] No bit mappings to export to PDF.")
-            return
+    #    ---------------- 按灯统计（用于条形图） ----------------
 
+    def _compute_per_light_stats_for_report(self, summary):
+        """
+        Aggregate approximate per-light trigger statistics purely from bit_mappings.
+
+        We do NOT go back to the full trial_log here, to keep the logic robust even if
+        logging formats change slightly. For each warning light, we look at all its
+        mapped bits and approximate:
+        - bit_on_events: sum of ON events across all mapped bits
+        - episodes:      max episodes across mapped bits (upper bound on trials
+                         where this light was involved)
+        - coverage:      episodes / total_trials
+        """
+        total_trials = summary.get("total_trials", 0) or 0
+        bit_mappings = summary.get("bit_mappings", []) or []
+
+        # 初始化所有灯，防止没映射的灯完全缺失
+        stats = {}
+        for idx, label in enumerate(self.labels):
+            stats[idx] = {
+                "index": idx,
+                "label": label,
+                "bit_on_events": 0,
+                "episodes": 0,
+                "coverage": 0.0,
+            }
+
+        for m in bit_mappings:
+            lamp_idx = int(m.get("lamp_index", 0))
+            s = stats.get(lamp_idx)
+            if s is None:
+                s = {
+                    "index": lamp_idx,
+                    "label": m.get("lamp_label", f"lamp_{lamp_idx}"),
+                    "bit_on_events": 0,
+                    "episodes": 0,
+                    "coverage": 0.0,
+                }
+                stats[lamp_idx] = s
+
+            s["bit_on_events"] += int(m.get("on_count", 0))
+            s["episodes"] = max(s["episodes"], int(m.get("episodes", 0)))
+
+        for s in stats.values():
+            if total_trials > 0:
+                s["coverage"] = s["episodes"] / float(total_trials)
+            else:
+                s["coverage"] = 0.0
+
+        per_light = sorted(
+            stats.values(),
+            key=lambda d: (-d["bit_on_events"], -d["episodes"], d["index"]),
+        )
+        return per_light
+
+    # ---------------- 新增：按灯聚合的 signal-level 候选字段 ----------------
+    def _build_signal_candidates_for_report(self, bit_mappings):
+        """
+        Group bit-level mappings into contiguous bit fields per (lamp, ID),
+        so that the PDF can report 'signal-like' candidates instead of raw bits.
+        """
+        if not bit_mappings:
+            return []
+
+        grouped = {}  # key: (lamp_index, id) -> list of bit mappings
+        for m in bit_mappings:
+            lamp_idx = int(m.get("lamp_index", 0))
+            cid = int(m.get("id", 0))
+            key = (lamp_idx, cid)
+            grouped.setdefault(key, []).append(m)
+
+        candidates = []
+        for (lamp_idx, cid), bits in grouped.items():
+            if not bits:
+                continue
+
+            # 按线性 bit 索引排序（byte_index * 8 + bit_index）
+            bits_sorted = sorted(
+                bits,
+                key=lambda b: (
+                        int(b.get("byte_index", 0)) * 8 + int(b.get("bit_index", 0))
+                ),
+            )
+
+            # 分割成若干连续 bit cluster（每个 cluster 视作一个候选“字段”）
+            clusters = []
+            current_cluster = [bits_sorted[0]]
+            prev_lin = (
+                    int(bits_sorted[0].get("byte_index", 0)) * 8
+                    + int(bits_sorted[0].get("bit_index", 0))
+            )
+            for b in bits_sorted[1:]:
+                lin = int(b.get("byte_index", 0)) * 8 + int(b.get("bit_index", 0))
+                if lin == prev_lin + 1:
+                    current_cluster.append(b)
+                else:
+                    clusters.append(current_cluster)
+                    current_cluster = [b]
+                prev_lin = lin
+            clusters.append(current_cluster)
+
+            for cluster in clusters:
+                lin_positions = [
+                    int(c.get("byte_index", 0)) * 8 + int(c.get("bit_index", 0))
+                    for c in cluster
+                ]
+                start_bit = min(lin_positions)
+                end_bit = max(lin_positions)
+                length = end_bit - start_bit + 1
+
+                avg_conf = float(
+                    sum(float(c.get("confidence", 0.0)) for c in cluster)
+                    / float(len(cluster))
+                )
+                max_conf = max(float(c.get("confidence", 0.0)) for c in cluster)
+                total_on = int(sum(int(c.get("on_count", 0)) for c in cluster))
+                episodes = int(max(int(c.get("episodes", 0)) for c in cluster))
+                pol_counter = Counter(c.get("polarity", "unknown") for c in cluster)
+                polarity = pol_counter.most_common(1)[0][0]
+
+                lamp_label = cluster[0].get("lamp_label", f"lamp_{lamp_idx}")
+                id_hex = cluster[0].get("id_hex", f"0x{cid:03X}")
+                bit_positions = sorted(
+                    {
+                        (
+                            int(c.get("byte_index", 0)),
+                            int(c.get("bit_index", 0)),
+                        )
+                        for c in cluster
+                    }
+                )
+
+                candidates.append(
+                    {
+                        "id": cid,
+                        "id_hex": id_hex,
+                        "lamp_index": lamp_idx,
+                        "lamp_label": lamp_label,
+                        "start_bit": start_bit,
+                        "end_bit": end_bit,
+                        "length": length,
+                        "avg_conf": avg_conf,
+                        "max_conf": max_conf,
+                        "total_on": total_on,
+                        "episodes": episodes,
+                        "polarity": polarity,
+                        "bits": bit_positions,
+                    }
+                )
+
+        candidates.sort(
+            key=lambda c: (
+                -c["max_conf"],
+                -c["episodes"],
+                c["id"],
+                c["lamp_index"],
+                c["start_bit"],
+            )
+        )
+        return candidates
+
+    def _write_pdf_dbc_table(self, summary, path: str) -> None:
+        """
+        Full multi-section report:
+
+        1) Run overview: global stats + per-ID table + per-light bar chart
+        2) Signal-level candidates grouped by warning light
+        3) Byte-level layout for high-value IDs
+        """
         try:
             from reportlab.lib.pagesizes import A4, landscape
             from reportlab.lib import colors
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
             from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import (
+                SimpleDocTemplate,
+                Paragraph,
+                Spacer,
+                Table,
+                TableStyle,
+                PageBreak,
+            )
+            from reportlab.graphics.shapes import Drawing
+            from reportlab.graphics.charts.barcharts import VerticalBarChart
         except Exception as e:
-            print(f"[AdaptiveFuzzer] ReportLab not available, skip PDF export: {e}")
+            print(f"reportlab not available or failed to import ({e}), skip PDF generation")
             return
 
-        doc = SimpleDocTemplate(path, pagesize=landscape(A4))
+        doc = SimpleDocTemplate(
+            path,
+            pagesize=landscape(A4),
+            rightMargin=24,
+            leftMargin=24,
+            topMargin=24,
+            bottomMargin=24,
+        )
         styles = getSampleStyleSheet()
         story = []
 
-        title = Paragraph("Vision-Guided Candidate DBC Table", styles["Title"])
-        info = Paragraph(f"Run ID: {summary['run_id']}", styles["Normal"])
-        story.append(title)
-        story.append(Spacer(1, 6))
-        story.append(info)
+        # ---------- Part 1: Run overview ----------
+        story.append(Paragraph("Vision-Guided Adaptive CAN Fuzzing Report", styles["Title"]))
         story.append(Spacer(1, 12))
 
-        # 表 1：每个 ID 的统计
-        if id_summary:
-            data1 = [["ID (hex)", "Trials", "Mean reward", "#Patterns"]]
-            for entry in id_summary:
-                data1.append([
-                    entry["id_hex"],
-                    entry["trials"],
-                    f"{entry['mean_reward']:.2f}",
-                    entry["pattern_count"],
-                ])
-            table1 = Table(data1, repeatRows=1)
-            style1 = TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 9),
-                ("FONTSIZE", (0, 1), (-1, -1), 8),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ])
-            table1.setStyle(style1)
-            story.append(table1)
-            story.append(Spacer(1, 12))
+        run_id = summary.get("run_id", "-")
+        id_min, id_max = summary.get("global_id_range", (None, None))
+        total_trials = summary.get("total_trials", 0)
+        unique_patterns = summary.get("unique_patterns", 0)
+        multi_combo_count = summary.get("multi_combo_count", 0)
+        multi_combo_hits = summary.get("multi_combo_master_hits", 0)
 
-        # 表 2：bit-level 候选 DBC 表
-        data2 = [["ID (hex)", "Byte", "Bit", "Signal label", "Polarity",
-                  "Confidence", "#On", "#Off", "#Episodes", "Example payload"]]
-        for m in bit_mappings:
-            data2.append([
-                m["id_hex"],
-                m["byte_index"],
-                m["bit_index"],
-                m["label"],
-                m["polarity"],
-                f"{m['confidence']:.2f}",
-                m["on_count"],
-                m["off_count"],
-                m["episodes"],
-                m["example_payload"],
-            ])
+        overview_lines = [
+            f"Run ID: {run_id}",
+            (
+                f"CAN ID range: 0x{id_min:03X} – 0x{id_max:03X}"
+                if id_min is not None
+                else "CAN ID range: (not recorded)"
+            ),
+            f"Total trials: {total_trials}",
+            f"Unique warning-light patterns: {unique_patterns}",
+            f"Multi-ID combo trials: {multi_combo_count} (Master warning hit in {multi_combo_hits})",
+        ]
+        for line in overview_lines:
+            story.append(Paragraph(line, styles["Normal"]))
+        story.append(Spacer(1, 12))
 
-        table2 = Table(data2, repeatRows=1)
-        style2 = TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 9),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ])
-        table2.setStyle(style2)
-        story.append(table2)
+        # 1.1 Per-ID statistics table
+        story.append(Paragraph("Per-ID statistics (sorted by mean reward)", styles["Heading2"]))
+
+        id_rows = [["ID (hex)", "Trials", "Mean reward", "#Patterns"]]
+        for entry in summary.get("id_summary", []):
+            cid = int(entry.get("id", 0))
+            id_rows.append(
+                [
+                    entry.get("id_hex", f"0x{cid:03X}"),
+                    str(entry.get("trials", 0)),
+                    f"{entry.get('mean_reward', 0.0):.3f}",
+                    str(entry.get("pattern_count", 0)),
+                ]
+            )
+
+        id_table = Table(id_rows, repeatRows=1)
+        id_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, 0), 9),
+                    ("FONTSIZE", (0, 1), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ]
+            )
+        )
+        story.append(id_table)
+        story.append(Spacer(1, 12))
+
+        # 1.2 Per-light stats + bar chart
+        bit_mappings = summary.get("bit_mappings", []) or []
+        per_light_stats = self._compute_per_light_stats_for_report(summary)
+
+        if per_light_stats:
+            story.append(Paragraph("Per-light trigger coverage", styles["Heading3"]))
+
+            # Tabular summary per light
+            light_rows = [["Index", "Label", "#Episodes (approx.)", "Coverage"]]
+            for s in per_light_stats:
+                cov_pct = s.get("coverage", 0.0) * 100.0
+                light_rows.append(
+                    [
+                        str(s["index"]),
+                        s.get("label", f"lamp_{s['index']}"),
+                        str(s.get("episodes", 0)),
+                        f"{cov_pct:.1f}%",
+                    ]
+                )
+
+            light_table = Table(light_rows, repeatRows=1)
+            light_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 8),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ]
+                )
+            )
+            story.append(light_table)
+            story.append(Spacer(1, 8))
+
+            # Bar chart: x 轴是灯 index，y 轴是 episodes（覆盖度）
+            try:
+                drawing = Drawing(480, 180)
+                bc = VerticalBarChart()
+                bc.x = 40
+                bc.y = 40
+                bc.height = 120
+                bc.width = 380
+                bc.data = [tuple(s.get("episodes", 0) for s in per_light_stats)]
+                bc.categoryAxis.categoryNames = [str(s["index"]) for s in per_light_stats]
+                bc.categoryAxis.labels.boxAnchor = "n"
+                bc.valueAxis.valueMin = 0
+                drawing.add(bc)
+                story.append(drawing)
+            except Exception as e:
+                print(f"Failed to add bar chart: {e}")
+        else:
+            story.append(Paragraph("No warning-light activity recorded in this run.", styles["Normal"]))
+
+        # ---------- Part 2: signal-level candidates ----------
+        story.append(PageBreak())
+        story.append(Paragraph("Signal-level candidates by warning light", styles["Heading2"]))
+
+        signal_candidates = self._build_signal_candidates_for_report(bit_mappings)
+
+        if not signal_candidates:
+            story.append(
+                Paragraph(
+                    "No signal-level candidates above thresholds in this run.",
+                    styles["Normal"],
+                )
+            )
+        else:
+            rows = [
+                [
+                    "Light label",
+                    "ID (hex)",
+                    "Bit range (start–end)",
+                    "Length",
+                    "Polarity",
+                    "Max conf.",
+                    "#Episodes",
+                ]
+            ]
+            for c in signal_candidates:
+                rows.append(
+                    [
+                        c.get("lamp_label", f"lamp_{c['lamp_index']}"),
+                        c.get("id_hex", f"0x{c['id']:03X}"),
+                        f"{c['start_bit']}–{c['end_bit']}",
+                        str(c["length"]),
+                        c.get("polarity", "?"),
+                        f"{c['max_conf']:.2f}",
+                        str(c.get("episodes", 0)),
+                    ]
+                )
+
+            sig_table = Table(rows, repeatRows=1)
+            sig_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 8),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ]
+                )
+            )
+            story.append(sig_table)
+
+        # ---------- Part 3: byte-level layout ----------
+        story.append(PageBreak())
+        story.append(Paragraph("Byte-level layout of high-value IDs", styles["Heading2"]))
+
+        if not signal_candidates:
+            story.append(
+                Paragraph(
+                    "No high-value IDs with stable bit mappings were found in this run.",
+                    styles["Normal"],
+                )
+            )
+        else:
+            # group candidates by ID
+            by_id = {}
+            for c in signal_candidates:
+                cid = c["id"]
+                by_id.setdefault(cid, []).append(c)
+
+            for cid in sorted(by_id.keys()):
+                cands = by_id[cid]
+                if not cands:
+                    continue
+
+                id_hex = cands[0].get("id_hex", f"0x{cid:03X}")
+                story.append(Paragraph(f"ID {id_hex} ({cid})", styles["Heading3"]))
+
+                # 对每个 byte 收集所有字段描述
+                byte_annotations = {i: [] for i in range(8)}
+                for cand in cands:
+                    per_byte = {}
+                    for (byte_idx, bit_idx) in cand.get("bits", []):
+                        per_byte.setdefault(byte_idx, []).append(bit_idx)
+
+                    for byte_idx, bit_list in per_byte.items():
+                        if byte_idx < 0 or byte_idx > 7:
+                            continue
+                        bits_sorted = sorted(set(bit_list))
+                        if not bits_sorted:
+                            continue
+
+                        segments = []
+                        start = prev = bits_sorted[0]
+                        for b in bits_sorted[1:]:
+                            if b == prev + 1:
+                                prev = b
+                            else:
+                                segments.append((start, prev))
+                                start = prev = b
+                        segments.append((start, prev))
+
+                        lamp_label = cand.get("lamp_label", f"lamp_{cand['lamp_index']}")
+                        for (sbit, ebit) in segments:
+                            if sbit == ebit:
+                                bit_desc = f"b{sbit}"
+                            else:
+                                bit_desc = f"b{sbit}-{ebit}"
+                            desc = f"{lamp_label} ({bit_desc})"
+                            byte_annotations[byte_idx].append(desc)
+
+                header_row = [f"Byte {i}" for i in range(8)]
+                value_row = []
+                for i in range(8):
+                    ann = byte_annotations.get(i) or []
+                    if not ann:
+                        value_row.append("unknown / unused")
+                    else:
+                        seen = set()
+                        uniq_ann = []
+                        for a in ann:
+                            if a not in seen:
+                                seen.add(a)
+                                uniq_ann.append(a)
+                        value_row.append("; ".join(uniq_ann))
+
+                layout_table = Table([header_row, value_row])
+                ts_cmds = [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ]
+
+                # 已识别字段用浅绿色，未知 byte 用灰色
+                for col, txt in enumerate(value_row):
+                    if txt.startswith("unknown"):
+                        ts_cmds.append(
+                            ("BACKGROUND", (col, 1), (col, 1), colors.lightgrey)
+                        )
+                    else:
+                        ts_cmds.append(
+                            ("BACKGROUND", (col, 1), (col, 1), colors.lightgreen)
+                        )
+
+                layout_table.setStyle(TableStyle(ts_cmds))
+                story.append(layout_table)
+                story.append(Spacer(1, 12))
 
         doc.build(story)
-        print(f"[AdaptiveFuzzer] DBC candidate PDF written to {path}")
 
     def _save_logs_and_report(self):
         """
