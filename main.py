@@ -264,7 +264,6 @@ def super_adaptive_main():
         detector=detector,
         id_start=0x100,
         id_end=0x1FF,
-        seed_ids=[0x180, 0x181, 0x182, 0x183, 0x184, 0x185, 0x186],  # 可选
         epsilon=0.2,
         alpha=1.0,
         beta=5.0,
